@@ -144,6 +144,64 @@ No rasterization. No hybrid primary visibility. Rays go through the hierarchy di
 
 ---
 
+## How the Minecraft block voxelizer works
+
+This is the algorithm for turning Minecraft block models and textures into 16x16x16 voxel bricks. Every block state gets voxelized once, offline, by reading directly from the Minecraft client JAR. The output is a `VoxelGrid` per block state: a 4096-bit occupancy bitmask, a per-voxel color palette with indices, and an emissive flag.
+
+This algorithm is carried over from the old Chisel project. The storage format around it is being redesigned, but the voxelization logic itself works and is worth keeping.
+
+### Block states
+
+Minecraft represents blocks as block states. A block state is a block type plus a set of properties. `oak_stairs[facing=east,half=bottom,shape=straight]` is one block state. `oak_stairs[facing=west,half=top,shape=inner_left]` is a different one. Every unique combination gets its own numeric ID. The voxelizer runs over all of them in parallel, with each worker thread opening the JAR independently and keeping its own texture cache.
+
+### Finding the right model
+
+The JAR has a blockstate JSON for each block at `assets/minecraft/blockstates/{name}.json`. There are two kinds.
+
+**Variant blocks** have a `variants` map. Keys are property filters like `"facing=east,half=bottom"`. You find the entry that matches the most properties and use that model.
+
+**Multipart blocks** (fences, walls, glass panes) have a `multipart` array. The difference here is that *all* matching entries apply, not just the best one. A fence post is one model, each connected arm is a separate model, and you composite them all together. The `when` conditions support pipe-separated alternatives like `"north": "low|tall"` meaning north=low OR north=tall, plus `OR` arrays for more complex cases.
+
+### Resolving the model
+
+Model JSONs live at `assets/minecraft/models/{name}.json`. Models can have a parent, so you walk the chain until you hit a builtin or run out. Texture references are merged from the whole chain, with child values winning over parent values. Texture names starting with `#` are variables, like `#all` or `#side`. You resolve them by looking them up in the merged texture map repeatedly until none start with `#` anymore.
+
+### Generating quads
+
+Each model is a list of elements. An element is a cuboid defined by `from` and `to` in [0,16]^3 space, with a face on each of its six sides.
+
+For each face, the voxelizer generates a quad. The vertices get computed from `from`/`to` and the face direction, then two adjustments happen. First, the face gets shifted 0.5 units inward along its normal and shrunk 0.5 units on each edge in the face plane. This puts it inside the voxels it belongs to rather than sitting exactly on their boundary, which would cause the SAT test to miss it. Zero-thickness quads, like cross models for flowers or chains, get nudged 0.5 units instead, for the same reason. Then element rotation is applied if the element JSON has a `rotation` block, followed by blockstate variant rotation: Y axis first, then X, both around the block center (8,8,8).
+
+UV conventions follow Blockbench's `CubeFace.UVToLocal()` exactly, which is the reference for how Minecraft renders models.
+
+### SAT intersection test
+
+For each quad, the voxelizer iterates over every voxel in the quad's bounding box and runs a Separating Axis Theorem test to see if they actually intersect. The test checks: the three world axes (X, Y, Z), the quad's own normal, and the 12 cross products of the four quad edges with the three world axes. If any axis separates the quad from the voxel AABB, they don't intersect.
+
+This is a strict test and it needs to be. For something like a chain model or a cross-shaped plant, the bounding box is much bigger than the actual geometry. Without SAT, you'd get a lot of solid voxels that shouldn't be there.
+
+### Texture sampling
+
+For voxels that pass SAT, the voxelizer samples the texture at the voxel center. To do that it undoes the blockstate rotation, undoes any element rotation, then computes the UV at that local position. UV rotation from the face JSON is applied too.
+
+Two accumulator buffers are kept per voxel: one for tinted quads and one for untinted ones. Tinted quads are those with a `tintindex` in the model JSON, meaning they want a biome color multiplied in. Grass and foliage use this. Rather than averaging tinted and untinted samples together, the tinted color gets alpha-composited over the untinted base. That's what makes `grass_block` look right: the dirt texture is the base, the green overlay composites on top.
+
+Biome tints are hardcoded plains values. Grass is `#91BD59`, foliage (leaves, vines) is `#77AB2F`. No biome blending.
+
+### Special cases
+
+Air returns an empty grid immediately.
+
+Fluids (water and lava) have no usable model in the JAR, so they're generated procedurally. Level 0 (source) and level 8+ (falling) fill the full 16-voxel height. Levels 1-7 fill `(8 - level) * 2` voxels from the bottom. The top surface samples the still texture, side voxels sample the flow texture, and water gets tinted to plains water color (`#3F76E4`).
+
+Waterlogged blocks get voxelized normally first, then every empty voxel gets filled with water using the same still/flow logic.
+
+Animated textures are stored as vertically stacked frames in the PNG (height > width). Only the first frame is used.
+
+Emissive blocks are tracked as a boolean on the `VoxelGrid`. Glowstone, lanterns, torches, lava, magma, etc. are always emissive. Some are conditional: furnaces and campfires when `lit=true`, redstone torches when `lit` is absent or `"true"` (they're lit by default), cave vines when `berries=true`.
+
+---
+
 ## Suggested project structure
 
 This is a guideline, not a specification. The actual layout will evolve as the project grows.
