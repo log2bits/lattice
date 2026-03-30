@@ -1,0 +1,5 @@
+[workspace]
+members = [
+  "crates/lattice-dag"
+]
+resolver = "2"
