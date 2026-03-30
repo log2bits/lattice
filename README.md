@@ -52,6 +52,34 @@ The point is that the compression strategy comes from what the scene actually lo
 
 ---
 
+## Geometry and color as parallel DAGs
+
+Both geometry and color use the same underlying DAG implementation. The DAG itself doesn't know what it's storing. It's just a configurable tree where each level can independently have deduplication enabled or disabled, and each level can have palette compression enabled or disabled. You configure it per-level, and the same code handles both cases.
+
+The geometry DAG stores occupancy. Each leaf is a bitmask of which voxels in a brick are solid. Each interior node is a sparse child list. Levels with deduplication enabled intern their nodes into a global table and share identical subtrees. Levels without deduplication just store each node individually, like a plain SVO. Which levels get deduplication is what the analyzer decides.
+
+The color DAG stores material data. Same structure, same code, different payload at the leaves. A color leaf stores a palette plus one index per occupied voxel. Or if every occupied voxel in the brick is the same color, it's just a uniform flag plus one color value, no palette, no indices.
+
+Because they're the same implementation, any improvement to the DAG, whether it's a better hash function, a different node layout, a new compression mode, applies to both automatically.
+
+### How traversal works
+
+You traverse both trees at the same time, taking the same spatial path through both. At each level you compute the slot index from the current ray position and step into the corresponding child in both the geometry node and the color node. The geometry side tells you whether a child exists at all. If the geometry child is empty you don't need to look at the color side. If it exists, you step into both.
+
+When you reach the geometry leaf, you check the occupancy bitmask for the specific voxel slot the ray hit. Then you read the color leaf to get the palette and look up the index at that same slot.
+
+So at every level it's two pointer chases instead of one. That's the full cost of the parallelism. Cache behavior stays predictable because both trees cover the same space and you're traversing them in the same order.
+
+### What the analyzer decides
+
+For each tree independently, the analyzer measures the dedup rate at each level and picks which levels are worth deduplicating. A level with 80% duplicate nodes is a great candidate. A level where almost every node is unique isn't worth the overhead of hashing and interning.
+
+For the color tree specifically, it also measures palette sizes at each candidate leaf size. If 16^3 bricks almost always fit in under 256 colors, use palette plus u8 indices. If they usually fit in 16, use u4. If a level has a lot of uniform nodes, the uniform flag encoding is used there. All of those decisions go into the file header as per-level flags, and the runtime reads them to know how to interpret each node it encounters.
+
+The number of tree levels per chunk is also a variable the analyzer can tune. A world with very coarse structure might benefit from fewer levels. A world with fine-grained variation might want more. The geometry and color trees don't have to have the same number of levels, though in practice they usually will since they're covering the same space.
+
+---
+
 ## The .lattice file format
 
 The file format is self-describing. The header records exactly how the data was compressed, so the runtime doesn't need to guess.
@@ -213,15 +241,31 @@ lattice/
   Cargo.toml                     # workspace root
 
   crates/
+    lattice-dag/
+      Cargo.toml
+      src/
+        lib.rs                   # DAG type, LevelConfig, per-level dedup/palette flags
+        node.rs                  # node layout: interior, leaf, uniform
+        intern.rs                # hash-table node interning, global dedup tables
+        palette.rs               # palette encoding (u4/u8 indices, uniform flag)
+        traverse.rs              # iterator that walks two DAGs in parallel
+
     lattice-import/
       Cargo.toml
       src/
-        lib.rs                   # unified voxel representation, shared types
+        lib.rs                   # shared VoxelBrick type, importer trait
         minecraft/
           mod.rs                 # minecraft importer entry point
           region.rs              # .mca parsing, sector table, decompression
           chunk.rs               # NBT decoding, block section extraction
           block_states.rs        # block state string -> numeric ID mapping
+          bake/
+            mod.rs               # block model voxelizer entry point
+            jar.rs               # client JAR reader with decompression cache
+            blockstate.rs        # blockstate JSON parsing, variant/multipart resolution
+            model.rs             # model JSON parsing, parent chain resolution, quad gen
+            texture.rs           # PNG loading, animated texture handling, tint
+            voxelizer.rs         # SAT intersection, texture sampling, fluid generation
           legacy.rs              # pre-1.13 numeric ID + metadata (TODO)
         mesh/
           mod.rs                 # triangle mesh voxelizer entry point
@@ -233,18 +277,17 @@ lattice/
       Cargo.toml
       src/
         lib.rs                   # analysis entry point, AnalysisReport type
-        repetition.rs            # DAG dedup estimates at each tree level
-        materials.rs             # palette size distributions, material counts
+        repetition.rs            # dedup rate estimates per level for geometry and color
+        palette.rs               # palette size distributions per level
         bricks.rs                # brick size / reuse tradeoff measurements
-        strategy.rs              # translates measurements into a CompressionStrategy
+        strategy.rs              # translates measurements into a TreeConfig per channel
 
     lattice-pack/
       Cargo.toml
       src/
         lib.rs                   # packing entry point, reads AnalysisReport
-        tree.rs                  # 64-tree construction from voxel data
-        dag.rs                   # DAG deduplication, leaf and interior node interning
-        palette.rs               # palette encoding at each level
+        geometry.rs              # builds geometry DAG from VoxelBrick occupancy
+        color.rs                 # builds color DAG from VoxelBrick material data
         lod.rs                   # LOD representation generation
         serialize.rs             # .lattice file writing, header construction
 
@@ -252,11 +295,11 @@ lattice/
       Cargo.toml
       src/
         lib.rs                   # loader entry point
-        header.rs                # .lattice header parsing
+        header.rs                # .lattice header parsing, TreeConfig reconstruction
         stream.rs                # streaming and demand-load logic
         lod.rs                   # LOD selection based on camera distance
-        upload.rs                # CPU -> GPU buffer upload
-        buffers.rs               # GPU buffer layout definitions
+        upload.rs                # CPU -> GPU buffer upload for both DAGs
+        buffers.rs               # GPU buffer layout for geometry and color channels
 
     lattice-render/
       Cargo.toml
@@ -264,14 +307,14 @@ lattice/
         lib.rs                   # renderer entry point
         tracer.rs                # render loop, pass orchestration
         camera.rs                # camera state, ray generation
-        traverse.rs              # 64-tree traversal pass
+        traverse.rs              # parallel geometry+color DAG traversal pass
         gi.rs                    # path traced indirect lighting, per-face accumulation
         lod.rs                   # LOD-aware traversal decisions
         debug.rs                 # debug overlay passes
 
   shaders/
     common.wgsl                  # shared math, type definitions
-    traverse.wgsl                # 64-tree traversal
+    traverse.wgsl                # parallel geometry+color DAG traversal
     primary.wgsl                 # primary ray dispatch
     gi.wgsl                      # indirect lighting passes
     accumulate.wgsl              # per-face GI accumulation, weighted update
