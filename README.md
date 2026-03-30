@@ -36,7 +36,7 @@ Everything else, including compression strategy, brick size, DAG usage, and LOD 
 
 ## Why the analysis stage exists
 
-The old Chisel project used a fixed compression strategy. It worked great for Minecraft because it was designed around Minecraft's specific structure. This project is different.
+Fixed compression strategies work great for Minecraft because they are designed around Minecraft's specific structure, but I want something more general.
 
 Before compressing anything, `lattice-analyze` runs a full pass over the voxel data and measures things like:
 
@@ -134,7 +134,7 @@ Reads `.lattice` files and constructs the runtime working set. Handles streaming
 - Mid-distance regions load at reduced detail.
 - Far regions load as coarse representations only.
 
-The loader decides how much of the hierarchy to bring in based on camera distance. It doesn't just mirror the disk structure into memory.
+The loader decides how much of the hierarchy to bring in based on camera distance. It doesn't just mirror the disk structure into memory. A good rule of thumb, is that if a single voxel face is far enough that it is smaller than a single pixel on screen, you switch to using the coarser LOD instead.
 
 ### lattice-render
 
@@ -146,9 +146,7 @@ No rasterization. No hybrid primary visibility. Rays go through the hierarchy di
 
 ## How the Minecraft block voxelizer works
 
-This is the algorithm for turning Minecraft block models and textures into 16x16x16 voxel bricks. Every block state gets voxelized once, offline, by reading directly from the Minecraft client JAR. The output is a `VoxelGrid` per block state: a 4096-bit occupancy bitmask, a per-voxel color palette with indices, and an emissive flag.
-
-This algorithm is carried over from the old Chisel project. The storage format around it is being redesigned, but the voxelization logic itself works and is worth keeping.
+This is the algorithm for turning Minecraft block models and textures into 16x16x16 voxel bricks. Every block state gets voxelized once, offline, by reading directly from the Minecraft client JAR. The output is a simple 16^3 grid of voxels per block state, pallete compressed to 256 different materials per block. Each voxel gets it's own material data including color, transparency, emmisivness, and diffuse.
 
 ### Block states
 
@@ -156,7 +154,7 @@ Minecraft represents blocks as block states. A block state is a block type plus 
 
 ### Finding the right model
 
-The JAR has a blockstate JSON for each block at `assets/minecraft/blockstates/{name}.json`. There are two kinds.
+The JAR has a blockstate JSON for each block. There are two kinds.
 
 **Variant blocks** have a `variants` map. Keys are property filters like `"facing=east,half=bottom"`. You find the entry that matches the most properties and use that model.
 
@@ -164,13 +162,19 @@ The JAR has a blockstate JSON for each block at `assets/minecraft/blockstates/{n
 
 ### Resolving the model
 
-Model JSONs live at `assets/minecraft/models/{name}.json`. Models can have a parent, so you walk the chain until you hit a builtin or run out. Texture references are merged from the whole chain, with child values winning over parent values. Texture names starting with `#` are variables, like `#all` or `#side`. You resolve them by looking them up in the merged texture map repeatedly until none start with `#` anymore.
+Models can have a parent, so you walk the chain until you hit a builtin or run out. Texture references are merged from the whole chain, with child values winning over parent values. Texture names starting with `#` are variables, like `#all` or `#side`. You resolve them by looking them up in the merged texture map repeatedly until none start with `#` anymore.
 
 ### Generating quads
 
 Each model is a list of elements. An element is a cuboid defined by `from` and `to` in [0,16]^3 space, with a face on each of its six sides.
 
-For each face, the voxelizer generates a quad. The vertices get computed from `from`/`to` and the face direction, then two adjustments happen. First, the face gets shifted 0.5 units inward along its normal and shrunk 0.5 units on each edge in the face plane. This puts it inside the voxels it belongs to rather than sitting exactly on their boundary, which would cause the SAT test to miss it. Zero-thickness quads, like cross models for flowers or chains, get nudged 0.5 units instead, for the same reason. Then element rotation is applied if the element JSON has a `rotation` block, followed by blockstate variant rotation: Y axis first, then X, both around the block center (8,8,8).
+There are two model parts to worry about. Volumetric model parts and thin model parts.
+
+For a volumetric shape, you split it into a quad for each face, and shift the face inward toward by 0.5 voxels the center of the volume. You also clip off 0.5 voxels from all edges of each quad. This puts it inside the voxels it belongs to rather than sitting exactly on their boundary, which would cause the SAT test to miss it.
+
+Zero-thickness quads, like cross models for flowers or chains, get nudged 0.5 units instead, for the same reason. If the thin quad is at the edge of the block, you shift in inwards by 0.5 voxels. If the thin quad is inside the block, you shift it by 0.5 units away from the center of the block.
+
+Then element rotation is applied if the element JSON has a `rotation` block, followed by blockstate variant rotation: Y axis first, then X, both around the block center (8,8,8).
 
 UV conventions follow Blockbench's `CubeFace.UVToLocal()` exactly, which is the reference for how Minecraft renders models.
 
@@ -184,21 +188,19 @@ This is a strict test and it needs to be. For something like a chain model or a 
 
 For voxels that pass SAT, the voxelizer samples the texture at the voxel center. To do that it undoes the blockstate rotation, undoes any element rotation, then computes the UV at that local position. UV rotation from the face JSON is applied too.
 
-Two accumulator buffers are kept per voxel: one for tinted quads and one for untinted ones. Tinted quads are those with a `tintindex` in the model JSON, meaning they want a biome color multiplied in. Grass and foliage use this. Rather than averaging tinted and untinted samples together, the tinted color gets alpha-composited over the untinted base. That's what makes `grass_block` look right: the dirt texture is the base, the green overlay composites on top.
-
-Biome tints are hardcoded plains values. Grass is `#91BD59`, foliage (leaves, vines) is `#77AB2F`. No biome blending.
+There are special cases for water, foliage, grass, and leaves among other blocks that need to be tinted based on the biome. This is done identically to how minecraft hardcodes the tining, and assumes 15x15 biome blend is turned on.
 
 ### Special cases
 
 Air returns an empty grid immediately.
 
-Fluids (water and lava) have no usable model in the JAR, so they're generated procedurally. Level 0 (source) and level 8+ (falling) fill the full 16-voxel height. Levels 1-7 fill `(8 - level) * 2` voxels from the bottom. The top surface samples the still texture, side voxels sample the flow texture, and water gets tinted to plains water color (`#3F76E4`).
+Fluids (water and lava) have no usable model in the JAR, so they're generated procedurally. We need to do the same thing.
 
-Waterlogged blocks get voxelized normally first, then every empty voxel gets filled with water using the same still/flow logic.
+Waterlogged blocks get voxelized normally first, then every empty voxel gets filled with water.
 
 Animated textures are stored as vertically stacked frames in the PNG (height > width). Only the first frame is used.
 
-Emissive blocks are tracked as a boolean on the `VoxelGrid`. Glowstone, lanterns, torches, lava, magma, etc. are always emissive. Some are conditional: furnaces and campfires when `lit=true`, redstone torches when `lit` is absent or `"true"` (they're lit by default), cave vines when `berries=true`.
+Block material data is hardcoded. Certain blocks are hardcoded to have certain roughness material values or emissive material values. For blocks that need a mirror surface, like glass, the whole block and all voxels in it (except for when waterlogged) are encoded to have that hardcoded roughness value. For blocks that need to be emissive, and emissive value is picked, and a brightness threshold. Only voxels in the block that are brighter than the threshold are set to be emissive.
 
 ---
 
@@ -285,16 +287,9 @@ lattice/
 
 ---
 
-## What this is building on
-
-The predecessor to this project was Chisel, a Minecraft-specific voxel renderer that packed worlds into a contree DAG and rendered them via GPU raycasting. A bunch of things were learned there that feed into this design.
-
-The key findings:
-
-- A 64-tree (called a "contree" in Chisel) produces 37% fewer total nodes than an octree on Minecraft terrain. 4.8M unique nodes vs 7.6M for the octree on Hermitcraft Season 10.
+## Key findings from research:
+- A 64-tree (otherwise known as a "contree") produces 37% fewer total nodes than an octree on Minecraft terrain. It's also faster to ray traverse through, especially when storing a coarse 8 bit occupancy mask along with the 64 bit mask.
 - Leaf-level deduplication is where almost all the savings happen. At the 4^3 leaf level, 77% of nodes are duplicates. At the 64^3 root level, it's 0.1%.
 - Culling (removing voxels surrounded on all 6 sides by opaque blocks) eliminates 88% of solid voxels before any other compression runs. This has a bigger impact than any encoding choice.
-- Stacked palettes (chunk-level, region-level, tile-level) compress attribute data well. The biggest win is the inline tile palette at 4^3 scope. A 128^3 super-chunk palette was tested and performed worse because the larger palette increased bits-per-index more than it saved on header overhead.
-- Geometry and attribute encoding need to be traversed in sync. The attribute stream doesn't contain positional information. It relies on the geometry tree to know which voxel slots are occupied.
-
-Those specifics are Minecraft-specific, but the general shape of the analysis (measure repetition at each level, choose compression strategy based on what's actually there) is what this project generalizes into a proper pipeline.
+- Stacked palettes (chunk-level, region-level, tile-level) compress attribute data well. The biggest win is the inline tile palette at 4^3 scope. A 1024^3 chunk palette for pointers worked well for minecraft worlds, since each 64^3 chunk of minecraft blocks usually contains only around 100 unique blocks, which is 100 unique leaf brick pointers.
+- Geometry and attribute encoding can either be done seperately or together. Usually, you want the attributes (material voxel data) to be encoded seperately into a different data structure. Then when you traverse the tree, you count up how many voxels each layer you pass though has (each node in the tree has a voxel_count) and when you finally reach the bottom, you have a unique index for that voxel specificallty to lookup into the seperate material data structure.
