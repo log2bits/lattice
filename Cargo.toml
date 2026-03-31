@@ -1,5 +1,14 @@
-[workspace]
-members = [
-  "crates/lattice-dag"
-]
-resolver = "2"
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wgpu = "22"
+winit = "0.30"
+gltf = "1"
+rayon = "1"
+anyhow = "1"

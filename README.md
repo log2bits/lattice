@@ -7,10 +7,10 @@ A voxel renderer with full path tracing. Lattice voxelizes a glTF scene, compres
 ## Pipeline
 
 ```
-[lattice-import]   glTF scene -> sorted (position, voxel) stream
-[lattice-pack]     sorted voxel stream -> geometry DAG + material array -> .lattice file
-[lattice-load]     .lattice file -> GPU-ready buffers
-[lattice-render]   GPU buffers -> path traced image
+[import]   glTF scene -> sorted (position, voxel) stream
+[pack]     sorted voxel stream -> geometry DAG + material array -> .lattice file
+[load]     .lattice file -> GPU-ready buffers
+[render]   GPU buffers -> path traced image
 ```
 
 Each stage is independent. The handoff between stages is a well-defined data structure, so you can test any stage in isolation or swap in a different importer.
@@ -232,60 +232,54 @@ Section tags:
 lattice/
   Cargo.toml
 
-  crates/
-    lattice-dag/
-      src/
-        lib.rs          # Dag, Level (SoA), MaterialLut
-        node.rs         # LEAF_FLAG and child entry helpers
-        voxel.rs        # Voxel struct and ColorPalette
+  src/
+    dag/
+      mod.rs          # Dag, Level (SoA), MaterialLut
+      node.rs         # LEAF_FLAG and child entry helpers
+      voxel.rs        # Voxel struct and ColorPalette
 
-    lattice-import/
-      src/
-        lib.rs          # importer entry point, VoxelChunk output type
-        palette.rs      # k-means++ in OKLab space, texture sampling
-        gltf/
-          mod.rs        # glTF scene loading, chunk dispatch
-          mesh.rs       # mesh data extraction, triangle clipping to chunks
-          material.rs   # PBR material -> Voxel mapping
-          voxelizer.rs  # SAT intersection test, texture sampling, normal baking
+    import/
+      mod.rs          # importer entry point, VoxelChunk output type
+      palette.rs      # k-means++ in OKLab space, texture sampling
+      gltf/
+        mod.rs        # glTF scene loading, chunk dispatch
+        mesh.rs       # mesh data extraction, triangle clipping to chunks
+        material.rs   # PBR material -> Voxel mapping
+        voxelizer.rs  # SAT intersection test, texture sampling, normal baking
 
-    lattice-pack/
-      src/
-        lib.rs          # packing entry point
-        sort.rs         # k-way merge of sorted chunk streams (Morton order)
-        dag.rs          # bottom-up streaming DAG construction
-        materials.rs    # Dolonius material array, streamed to temp file
-        serialize.rs    # .lattice file writing, PSVDAG encoding
+    pack/
+      mod.rs          # packing entry point
+      sort.rs         # k-way merge of sorted chunk streams (Morton order)
+      dag.rs          # bottom-up streaming DAG construction
+      materials.rs    # Dolonius material array, streamed to temp file
+      serialize.rs    # .lattice file writing, PSVDAG encoding
 
-    lattice-load/
-      src/
-        lib.rs          # loader entry point
-        header.rs       # .lattice header parsing, section index
-        stream.rs       # PSVDAG DFS stream decoding, node index reconstruction
-        upload.rs       # CPU -> GPU buffer upload
+    load/
+      mod.rs          # loader entry point
+      header.rs       # .lattice header parsing, section index
+      stream.rs       # PSVDAG DFS stream decoding, node index reconstruction
+      upload.rs       # CPU -> GPU buffer upload
 
-    lattice-render/
-      src/
-        lib.rs          # renderer entry point
-        tracer.rs       # render loop, pass orchestration
-        camera.rs       # camera state, ray generation
-        traverse.rs     # 64-tree traversal, Dolonius material lookup
-        gi.rs           # path tracing, per-face accumulation
-        debug.rs        # debug overlay passes
+    render/
+      mod.rs          # renderer entry point
+      tracer.rs       # render loop, pass orchestration
+      camera.rs       # camera state, ray generation
+      traverse.rs     # 64-tree traversal, Dolonius material lookup
+      gi.rs           # path tracing, per-face accumulation
+      debug.rs        # debug overlay passes
 
   shaders/
-    common.wgsl         # shared math, type definitions
-    traverse.wgsl       # 64-tree DDA, Dolonius material index accumulation
-    primary.wgsl        # primary ray dispatch
-    gi.wgsl             # path tracing bounce loop
-    accumulate.wgsl     # per-face weighted GI accumulation
-    debug.wgsl          # debug overlays
+    common.wgsl       # shared math, type definitions
+    traverse.wgsl     # 64-tree DDA, Dolonius material index accumulation
+    primary.wgsl      # primary ray dispatch
+    gi.wgsl           # path tracing bounce loop
+    accumulate.wgsl   # per-face weighted GI accumulation
+    debug.wgsl        # debug overlays
 
   tools/
-    src/
-      pack.rs           # CLI: glTF scene -> .lattice
-      render.rs         # CLI: .lattice -> frames
-      inspect.rs        # CLI: print .lattice header and stats
+    pack.rs           # CLI: glTF scene -> .lattice
+    render.rs         # CLI: .lattice -> frames
+    inspect.rs        # CLI: print .lattice header and stats
 ```
 
 ---
