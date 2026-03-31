@@ -1,416 +1,302 @@
 # Lattice
 
-A general-purpose voxel engine with full path tracing as the primary rendering method. Lattice takes voxel data from any source, analyzes it, compresses it into a custom on-disk format, and renders it via GPU path tracing through a 64-tree hierarchy.
-
-It works great for Minecraft-style worlds, but it's not limited to them.
+A voxel renderer with full path tracing. Lattice voxelizes a glTF scene, compresses the geometry into a sparse voxel DAG, stores material data in a separate flat array using the Dolonius method, and renders via GPU path tracing.
 
 ---
 
-## Overview
-
-The pipeline has five stages, each handled by a separate crate:
+## Pipeline
 
 ```
-[lattice-import]   external source -> unified internal voxel representation
-[lattice-analyze]  voxel data -> compression statistics and strategy recommendation
-[lattice-pack]     voxel data + strategy -> compressed .lattice file on disk
-[lattice-load]     .lattice file -> runtime working set, streamed with LODs
-[lattice-render]   runtime voxel data -> GPU path tracing
+[lattice-import]   glTF scene -> sorted (position, voxel) stream
+[lattice-pack]     sorted voxel stream -> geometry DAG + material array -> .lattice file
+[lattice-load]     .lattice file -> GPU-ready buffers
+[lattice-render]   GPU buffers -> path traced image
 ```
 
-Each stage can run independently. The handoff between them is a well-defined data structure, so you can slot in a different importer, swap the compressor, or test the renderer against hand-crafted data.
+Each stage is independent. The handoff between stages is a well-defined data structure, so you can test any stage in isolation or swap in a different importer.
 
 ---
 
 ## Design choices that are fixed
 
-These aren't up for debate on a per-scene or per-platform basis:
-
-- The runtime tree structure is always a **64-tree**. No octree mode.
+- The runtime tree structure is always a **64-tree** (4x4x4 branching per node). No octree mode.
 - The renderer is always **full path tracing**. No rasterization fallback, no hybrid primary visibility.
-- Temporal GI accumulation uses a running weighted formula. No long sample history buffers.
-
-Everything else, including compression strategy, brick size, DAG usage, and LOD depth, is decided by the analysis stage based on the actual scene.
-
----
-
-## Why the analysis stage exists
-
-Fixed compression strategies work great for Minecraft because they are designed around Minecraft's specific structure, but I want something more general.
-
-Before compressing anything, `lattice-analyze` runs a full pass over the voxel data and measures things like:
-
-- how many unique materials appear at each level
-- how often material counts fit under useful thresholds (16, 32, 64, 256 materials)
-- how many tree levels are appropriate for the scene's resolution and structure
-
-For a voxelized Minecraft world, it might find that voxel materials stay under 256 unique values. From that, the compressor knows to use u8 palette indices at the leaf level. For a different kind of scene, the answer might be completely different.
-
-The point is that the compression strategy comes from what the scene actually looks like, not from hardcoded assumptions.
+- The entire scene is one single DAG. No per-region trees, no separate geometry table.
+- Geometry and material data are stored separately. The DAG is geometry-only; materials live in a flat array indexed by the Dolonius voxel-count method.
+- No LOD. Every ray traverses to the leaf.
+- No editing during rendering. The data is built once and uploaded. Read-only at runtime.
 
 ---
 
-## Geometry and material as separate DAGs
+## Voxelization pipeline
 
-Geometry and material are stored in two completely independent DAGs. They compress independently, which is the whole point.
+Voxelization is split from DAG construction. The voxelizer produces a sorted stream of `(position, voxel)` pairs; the packer consumes that stream and builds the DAG. This separation keeps memory bounded and makes the two stages independently testable.
 
-The geometry DAG is `Dag<()>`. It stores only occupancy. Its leaf pool has exactly one entry, solid. Every solid voxel in the world points to `LEAF_FLAG | 0`. Because material is stripped out entirely, identical geometry patterns deduplicate regardless of what material they contain. Two rooms with the same shape but different block types share geometry nodes. Two walls with the same structure but different textures share geometry nodes. The dedup potential is dramatically higher than a combined geometry+material tree.
+### Color palette first
 
-The material DAG is `Dag<Material>`. Air is material 0. Large uniform regions collapse to a LEAF_FLAG at a higher level with one material entry. The leaf pool has one entry per unique material in the scene.
+Before voxelizing any geometry, the importer samples all textures in the glTF and runs k-means++ clustering in OKLab space to produce a 256-color palette. OKLab is perceptually uniform, so k-means minimizes visible banding. The full palette is 768 bytes. It stays in L1 cache permanently once uploaded.
 
-Both use the same `Dag<T>` code. Any improvement to the core structure applies to both automatically.
+Sampling textures to build the palette is fast (a few thousand pixels per texture is plenty) and means voxelization runs in a single pass -- every sampled surface point gets a palette index immediately, no second pass needed.
 
-### Leaves at any level
+### Chunked parallel voxelization
 
-A leaf can appear at any level, not just the bottom. A LEAF_FLAG child at level 1 means every voxel in that entire subtree has the same data as that one leaf. This is how uniform regions are represented without any special sentinel values or inline encoding.
+The scene bounding box is divided into 256^3 voxel chunks. Each chunk is processed by a thread pool worker that takes all triangles intersecting that chunk and voxelizes them. Triangles are clipped to the chunk boundary before voxelization so nothing is processed twice and no holes appear at edges.
 
-In the children array, the high bit of each `u32` entry distinguishes interior nodes from leaves:
+Each worker outputs a sorted-by-Morton-code list of `(position, voxel)` pairs. Only surface voxels are emitted -- interior voxels that are completely surrounded by opaque neighbors on all six faces are culled at this stage.
 
-- Bit 31 = 0: interior node, lower 31 bits are an index into the next level's node pool
-- Bit 31 = 1: leaf, lower 31 bits are an index into the leaf pool
+In practice, occupancy in any given chunk is low (1-3% for typical glTF scenes), so each chunk's voxel list is a few MB at most even though the worst-case bound is 67MB (256^3 * 4 bytes).
 
-For geometry, every leaf is `()`, so the leaf pool has one entry and every solid voxel points to `LEAF_FLAG | 0`. For material, each unique material is one leaf entry. A `LEAF_FLAG` at a higher level in the material DAG means every voxel in that subtree has that material.
+### Streaming sort and DAG construction
 
-### Zero-cost LOD on the material DAG
+Once all chunks are voxelized, a k-way merge of the sorted chunk outputs produces a globally sorted voxel stream in Morton order. This merge is streaming -- only one chunk's data is in memory per thread at a time.
 
-Each interior node in the material DAG stores the most common (mode) material across its entire subtree. This is computed bottom-up during construction and stored in the node's otherwise-unused value slot using a SoA layout — the same technique as Voxelis. During rendering, stopping traversal early at any level gives you the representative material for that region without descending further. No separate LOD tree, no update passes, always consistent.
+The DAG builder consumes this sorted stream bottom-up. Consecutive voxels that share a parent node in the 64-tree form a group; the builder processes each group, hashes the resulting node, deduplicates it, and moves up a level. Identical geometric subtrees naturally share nodes regardless of their materials.
 
-### How traversal works
-
-Geometry and material are not traversed simultaneously. The traversal is sequential:
-
-1. Traverse the geometry DAG to find the hit voxel. This is the expensive step: DDA stepping, ray-AABB tests, the full ancestor stack. It terminates when the ray hits a solid leaf or exits the scene.
-2. You now have a 3D position. Traverse the material DAG from the root using that position. This is positional descent: at each level, extract 6 bits from the position coordinates to get the child index, check the occupancy mask, descend. No ray math. It terminates as soon as it hits a `LEAF_FLAG`, which for large uniform material regions is 1-2 levels deep.
-
-The geometry traversal dominates the total cost. The material lookup is cheap because it doesn't involve ray intersection math and terminates early for any region with uniform material.
-
-For distant geometry using LOD, the material traversal stops at a shallower level and reads the pre-computed representative material from that node instead of descending to the leaf.
-
-### Subtree pointer reuse
-
-Inserting a subtree into either DAG returns a `u32` root index. Because dedup is always on, any two subtrees with identical content return the same index. You can store that index and reuse it everywhere the same pattern appears without re-inserting anything.
-
-This is what makes bulk construction efficient. For a Minecraft world:
-
-1. Pre-voxelize each unique block and blockstate into a 16^3 voxel brick once. Insert into both DAGs. Store the resulting `(geo_root, mat_root)` pair in a lookup table keyed by block ID. A typical world has a few thousand unique entries.
-2. For each Minecraft chunk, read the block IDs, look up each one in the brick table, and assemble the chunk subtree by combining the pre-built roots. Every stone block in every chunk automatically shares the same geometry and material subtrees.
-3. Stream chunk by chunk. Each processed chunk contributes one root index to the world-level spatial map. The entire world never needs to be in memory at once.
-
-The actual work is proportional to the number of unique configurations, not total voxel count. A world with a trillion voxels but only a few thousand unique block types builds the leaf level once and assembles everything else from pointers.
-
-### What the analyzer decides
-
-Deduplication is always on at every level — the analyzer doesn't decide that. What it does decide:
-
-For the material tree, it measures the distribution of unique materials at the leaf level. If most voxels fit under 256 unique materials, use u8 palette indices. If they fit in 16, use u4. This palette encoding is the main thing the analyzer tunes.
-
-The number of tree levels is also a variable the analyzer can tune. A world with very coarse structure might benefit from fewer levels. A world with fine-grained variation might want more. The geometry and material trees don't have to have the same depth, though in practice they usually will.
+DAG deduplication is global and happens in memory. The geometry DAG is small enough that this is fine. The material array is built in parallel and streamed directly to a temp file, since it can be large and doesn't need to be in memory all at once. At the end, the packer writes the .lattice file: geometry sections first, then the material section appended from the temp file, then the header is finalized with the correct section offsets.
 
 ---
 
-## The entire world is one DAG
+## The DAG
 
-There are no separate per-chunk DAGs. The geometry DAG and color DAG each span the entire world. A spatial region (what you might call a "chunk") is just a `u32` root index into the top level's node pool. The pools themselves are world-scale flat arrays.
+The DAG is geometry-only. It stores solid/empty occupancy, nothing else. Because material data is absent, any two subtrees with the same geometric shape but different materials deduplicate to the same node. A wall with one texture and the same wall with a different texture share a node in the DAG.
 
-This is a bad idea with octrees. An octree node covers a 2^3 region, so a world-scale octree has an enormous number of nodes, and the overhead of one global dedup table across all of them outweighs the benefit. With a 64-tree, each node covers a 4^3 region, you have 37% fewer total nodes, and each node amortizes its overhead over 64 children instead of 8. The dedup is also more effective because a single 64-tree node captures a much larger spatial footprint than an octree node at the same depth.
+This maximizes the dedup ratio. For a scene like the Bistro, many surfaces are geometrically repetitive even when their materials vary. The geometry DAG also stays tight in cache during traversal since its nodes carry no material payload.
 
-The practical effect for a Minecraft world: a stone block pattern that appears in every chunk is stored exactly once in the world-level node pool. The dedup table catches it on the first insert; every subsequent region with the same content gets the same index back. That's true at every level — individual voxel materials, 4^3 voxel regions, 16^3 regions, all the way up.
-
-The one constraint this introduces is streaming. If two spatial regions share a node and one region is "unloaded," you can't free that node without checking whether anything else still references it. For offline rendering this doesn't matter — you load what you need and keep it. For real-time streaming it requires reference counting or a different eviction strategy. That's a problem for `lattice-load` to handle, not `lattice-dag`. The DAG itself is just a flat pool.
+The tradeoff is that material lookup requires computing a running index. During traversal, each ray accumulates a count of voxels in preceding sibling subtrees. When it hits a leaf, that count is the offset into the flat material array. This is the Dolonius (2017) method. The overhead is one addition per traversal step.
 
 ---
 
-## The .lattice file format
+## How the 64-tree is structured
 
-The file format is self-describing. The header records exactly how the data was compressed, so the runtime doesn't need to guess.
+Each level stores its nodes in SoA layout. All fields are indexed by node index.
 
-The header stores things like:
+- `occupancy: Vec<u64>` -- one bit per child slot. A 1 bit means a child exists there.
+- `voxel_count: Vec<u32>` -- total number of leaf voxels in this subtree. Used by Dolonius traversal to compute the material array index.
+- `children_start: Vec<u32>` -- where this node's children begin in the flat children array.
+- `children: Vec<u32>` -- packed child entries for all nodes in this level.
 
-- magic number and version
-- tree type (always 64-tree for now)
-- world bounds and voxel resolution
-- number of tree levels
-- LOD encoding info
-- spatial region root index table (region position -> root index in the top-level node pool)
-- byte offsets and sizes for each section (per-level node pools, children arrays, leaf pool)
+Only occupied children are stored. `occupancy[i].count_ones()` gives the child count.
 
-This means two .lattice files can be compressed completely differently and the runtime will handle both correctly. It also means the format can evolve without breaking old files.
+The SoA layout matters for GPU traversal. A warp of 32 threads reading occupancy for 32 different nodes touches one contiguous memory region. AoS would scatter those reads.
+
+Each child entry is a raw u32. Bit 31 (LEAF_FLAG) distinguishes two cases:
+
+- LEAF_FLAG set: the lower bits are a material LUT index. Every voxel in that subtree has the same material. A completely uniform region collapses to one entry at any level.
+- LEAF_FLAG clear: the lower bits are a node index into the next level's pool.
 
 ---
 
-## Disk format vs runtime format
+## Material data: the Dolonius method
 
-These are separate things with different goals.
+The flat material array stores LUT indices in the same order as a depth-first traversal of the geometry DAG would visit leaves. Each node stores `voxel_count`, the total number of leaf voxels in its subtree.
 
-The disk format is optimized for compression and storage. It uses the PSVDAG-style pointerless linearization plus palette compression at the leaves. You want the file to be small.
+During traversal, when the ray descends into a child, it adds up the `voxel_count` of every preceding sibling. That running sum is the material base index for the subtree the ray is entering. When the ray hits a leaf, `material_base + leaf_position` gives the exact offset into the flat material array.
 
-The runtime format is optimized for traversal speed and cache locality. The loader reads the disk format and reconstructs the indexed `Dag<T>` structure, then uploads the flat arrays to VRAM. The layouts serve different goals and are genuinely different things.
+This never reads material data during the traversal phase, only at hit time. The geometry traversal stays tight in cache.
 
-Don't assume that what's good on disk is good at runtime.
+Dolonius adds about 1% overhead to the DAG compared to pure geometry-only. Per-pointer approaches (Dado et al. 2016) add about 2x. For path tracing where traversal dominates, the 1% overhead is well worth the cache benefit.
 
-### Disk encoding: PSVDAG-style linearization
+---
 
-The disk format uses a pointerless depth-first linearization inspired by PSVDAG (Vokorokos et al. 2020). Instead of storing explicit child indices in the file, nodes are written out in depth-first order. Shared subtrees (DAG nodes referenced more than once) get a short label the first time they appear, and a caller (a back-reference to that label) every subsequent time. Both labels and callers use variable-length encoding, with shorter codes assigned to more frequently referenced nodes (frequency-based compaction).
+## Voxel format
 
-This removes all pointers from the file entirely. Compared to a pointer-based SVDAG, PSVDAG achieves 2.8-3.8x smaller file sizes. Compared to a plain pointerless SVO, it's usually smaller too once the scene has meaningful repetition.
-
-The tradeoff is that the file can't be traversed directly. Random reads are impossible — to find any node you'd have to scan linearly from the start of the stream.
-
-**PSVDAG is a file format, not an in-memory struct.** There is no `PackedDag` type anywhere in the codebase. `lattice-pack` does a depth-first traversal of the `RuntimeDag<T>` it just built, and streams the PSVDAG encoding directly to disk as it goes. The full pointerless structure only ever exists as bytes in the `.lattice` file. `lattice-load` reads that byte stream and reconstructs a `RuntimeDag<T>` in CPU memory, wiring up all the indices from the label/caller relationships.
-
-### CPU and VRAM use the same layout
-
-The `RuntimeDag<T>` that lives in CPU memory and the data uploaded to VRAM are the same structure. Each tree level is a flat array of interior nodes plus a flat packed children array. The leaf level is a flat array of `T`. Uploading to VRAM is just copying those flat arrays into GPU storage buffers. No transformation, no repacking.
+The material LUT is a flat array of deduplicated `Voxel` entries. Multiple positions in the flat material array can point to the same LUT entry, but `Voxel` values are stored once. The LUT is small enough to stay warm in cache.
 
 ```
-lattice-pack    walks RuntimeDag<T> depth-first, streams PSVDAG bytes to disk
+Voxel (4 bytes, packed u32):
 
-lattice-load    reads PSVDAG bytes, reconstructs RuntimeDag<T> in CPU memory,
-                uploads flat arrays to GPU storage buffers
-
-lattice-render  shader accesses GPU buffers by index — same layout as CPU
+  bits 31-15  normal      17-bit John White signed octahedral encoding
+  bit  14     transparent refracts rather than reflects
+  bit  13     metallic    conductor, albedo tints specular
+  bit  12     emissive    emits light at its albedo color
+  bits 11-8   roughness   0 = perfect mirror, 15 = fully diffuse
+  bits  7-0   palette     index into the scene's 256-entry color palette
 ```
 
-If cache optimization ever requires a different node ordering in VRAM (for example, sorting nodes by traversal frequency), `lattice-load` can repack during the upload step. But the logical structure is identical.
+**Normal encoding.** Normals use John White's signed octahedral encoding. Project the normal onto the L1 unit octahedron, rotate 45 degrees to redistribute quantization error uniformly, then store X and Y as u8 each plus a sign bit for Z. Average error is about 0.3 degrees. Decoding is one normalize in the shader.
+
+**Color palette.** 256 linear RGB entries, 768 bytes. Built at import time by sampling glTF textures and running k-means++ in OKLab space. Every voxel stores an 8-bit index into it.
+
+The number of unique voxel types determines `mat_index_bits`, the bit width needed to index the LUT:
+
+```
+log2(lut_entry_count) -> round up to next power of two
+
+examples:
+  2 unique voxels     -> 1 bit
+  200 unique voxels   -> 8 bits
+  50000 unique voxels -> 16 bits
+```
+
+`mat_index_bits` is stored in the .lattice header. The GPU reads it once as a uniform and extracts the index with `child & ((1 << mat_index_bits) - 1)`.
 
 ---
 
-## Temporal GI accumulation
+## Traversal
 
-Visible face lighting is stored per-face as a current color value. When a new sample arrives, it updates using:
+### Finding the hit
+
+The ray traverses the 64-tree using DDA stepping. At each node, the occupancy mask tells the shader which children exist. Empty children are skipped immediately. Occupied children either descend (LEAF_FLAG clear) or resolve (LEAF_FLAG set). An ancestor stack caches parent node indices so the ray doesn't re-descend from root on every step.
+
+While descending, the ray accumulates the material base index by summing `voxel_count` for preceding siblings. This is maintained on the ancestor stack alongside the node index, so the cost is one addition per descent step.
+
+When LEAF_FLAG is hit, `materials[material_base + leaf_position]` gives the LUT index, and `lut[lut_index]` gives the Voxel.
+
+### Traversal optimizations
+
+**Fractional coordinate encoding.** The tree lives in [1.0, 2.0). IEEE floats in that range have exponent zero, so the mantissa encodes position directly as fixed-point. Extracting the cell index at any level is `(bits(pos) >> scale_exp) & 3` -- two bit operations, no multiply or divide. Descending decrements `scale_exp` by 2.
+
+**Ancestor stack.** Caches parent node indices and material base offsets. When the ray steps to a neighbor, comparing old and new position bits identifies the highest level that changed. The stack has the right values ready. About 2x speedup over root-to-leaf descent.
+
+**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit occupancy mask. If so, the step size doubles. The check is one mask and compare on the existing field. Adds about 21% more iterations for free.
+
+**Ray-octant mirroring.** The coordinate system is mirrored to the negative ray octant at traversal start. With all direction components negative, finding the exit face simplifies to finding the minimum of three distances with no sign conditionals. About 10% faster.
+
+---
+
+## Lighting
+
+Lighting is full path tracing. Primary rays are dispatched from the camera. On each hit, the shader reads the Voxel, samples the BRDF (diffuse or specular depending on roughness/metallic flags), and dispatches a secondary ray. Emissive voxels contribute light directly. Shadow rays are not a separate pass -- they emerge naturally from the path tracing loop.
+
+Each voxel face stores a running weighted average of accumulated indirect light:
 
 ```
 L_new = (1 - alpha) * L_old + alpha * S
 ```
 
-where `L_old` is the stored value, `S` is the new sample, and `alpha` depends on the surface. More diffuse surfaces use a smaller alpha for stable accumulation. More view-dependent surfaces use a larger alpha to respond faster.
+`S` is the new path traced sample. `alpha` is tuned per surface type: small for diffuse (stable accumulation over many frames) and larger for specular (faster response to view changes). No sample history buffers, no reservoirs -- one color value per face.
 
-No sample history. No reservoir buffers. Just one color per face and a weight.
+Transparent voxels refract the ray using the surface normal. Metallic voxels tint the specular lobe by albedo. Emissive voxels inject radiance into the path without consuming a bounce.
+
+---
+
+## Disk format: PSVDAG
+
+On disk, sub-node references are removed from the children arrays. Nodes are written depth-first. The first time a unique node appears it gets a label. Every subsequent reference to the same node is a caller, a back-reference to that label. LEAF_FLAG entries are written as-is since they're terminal values.
+
+The loader reconstructs explicit sub-node indices by walking the DFS stream. Loading is close to a direct copy.
+
+PSVDAG achieves 2.8-3.8x smaller files than pointer-based SVDAG. For a scene with many repeated geometric structures, the sharing factor is large and PSVDAG captures most of it. Every repeated node appears once in the DFS stream and is referenced cheaply everywhere else.
+
+---
+
+## The .lattice file format
+
+```
+Header:
+  magic:           [u8; 4]    "LTCE"
+  version:         u16
+  flags:           u16
+  num_levels:      u8
+  mat_index_bits:  u8         1, 2, 4, 8, 16, or 32
+  world_min:       [i64; 3]   voxel-space coordinates
+  world_max:       [i64; 3]
+  section_count:   u32
+  sections:        [{tag: u32, offset: u64, size: u64}; section_count]
+```
+
+Sections are seekable independently via the offset table. Geometry sections are written first (they're small and needed to set up the traversal), then the material array (which is large and streamed in from a temp file during build).
+
+Section tags:
+
+```
+0x4C564C**  LVL*    one section per tree level (* = level index, 0 = root)
+  node_count:   u32
+  occupancy:    [u64; node_count]
+  voxel_count:  [u32; node_count]
+  children:     [u32; sum of popcount(occupancy[i]) for all nodes]
+                encoded in DFS order (PSVDAG: node refs replaced by caller labels)
+
+0x4C555400  LUT     material LUT (deduplicated Voxel entries)
+  entry_count:  u32
+  entries:      [Voxel; entry_count]   4 bytes each
+
+0x4D415400  MAT     flat material array (Dolonius DFS order)
+  entry_count:  u32
+  entries:      [u32; entry_count]   LUT indices
+
+0x50414C00  PAL     color palette
+  entry_count:  u32
+  entries:      [[u8; 3]; entry_count]   linear RGB
+
+0x53504958  SPIX    spatial index
+  entry_count:  u32
+  entries:      [{pos: [i32; 3], root_node_index: u32}; entry_count]
+```
 
 ---
 
 ## Modules
 
-### lattice-import
-
-Converts external formats into the unified internal voxel representation. Every importer produces the same output regardless of the source.
-
-Planned importers:
-
-- **Minecraft world importer.** Reads `.mca` region files, decodes NBT, maps block state strings to numeric IDs, assembles 64^3 chunks.
-- **General 3D model importer.** Takes triangle meshes or other standard 3D formats and voxelizes them.
-- **Other voxel format importers.** Common voxel file types where possible.
-
-The internal voxel representation is what `lattice-analyze` and `lattice-pack` consume. None of those stages should know or care which importer produced it.
-
-### lattice-analyze
-
-Runs offline over a complete voxel dataset and produces a compression strategy recommendation. This stage does no compression itself. It only measures.
-
-Output is a structured analysis report that `lattice-pack` reads to decide what to do.
-
-### lattice-pack
-
-Takes the voxel data and the analysis report and builds a `RuntimeDag<T>` in CPU memory, then streams it to disk as a PSVDAG-encoded `.lattice` file. The compression choices come from the report, not from hardcoded defaults.
-
-There is no intermediate `PackedDag` struct. Packing is a depth-first traversal of the `RuntimeDag<T>` that writes label/caller-encoded bytes directly to disk as each node is visited. The PSVDAG structure only ever exists on disk.
-
-This runs offline and can be as slow as it needs to be. It's where all the heavy CPU work happens.
-
-### lattice-load
-
-Reads `.lattice` files and reconstructs a `RuntimeDag<T>` in CPU memory by following the PSVDAG label/caller stream and wiring up node indices. Then uploads the flat node and leaf arrays to GPU storage buffers. Handles streaming and LODs.
-
-- Nearby regions load at full detail.
-- Mid-distance regions load at reduced detail.
-- Far regions load as coarse representations only.
-
-The loader decides how much of the hierarchy to bring in based on camera distance. It doesn't just mirror the disk structure into memory. A good rule of thumb is that if a single voxel face is far enough that it is smaller than a single pixel on screen, you switch to using the coarser LOD instead.
-
-### lattice-render
-
-GPU path tracer built around 64-tree traversal. Primary visibility, indirect lighting, emissives, reflections, refraction, all through the same traversal path.
-
-No rasterization. No hybrid primary visibility. Rays go through the hierarchy directly.
-
-The traversal shader uses several optimizations that compound on each other:
-
-**Fractional coordinate encoding.** The tree lives in the coordinate range [1.0, 2.0). This isn't arbitrary. IEEE floats in that range have exponent zero, so the mantissa encodes position directly as a fixed-point value. Extracting the cell index at any tree level is just `(bits(pos) >> scale_exp) & 3` -- two bit operations, no multiply or divide. Descending a level decrements `scale_exp` by 2. The full traversal loop runs in float space and never needs to convert to integers for addressing.
-
-**Ancestor stack.** Rather than re-descending from the root every iteration, the traversal maintains a small stack of ancestor node indices. When the ray steps to a neighboring cell, it checks whether that neighbor is a sibling (same parent), or whether it crosses a node boundary and needs to ascend. The common ancestor is identified by comparing the bits of the old and new positions: the highest bit that changed tells you which level the boundary is at, and the stack has the right node index ready. This alone is about a 2x speedup over root-to-leaf descent every step.
-
-**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit child mask. If it is, the step size doubles for that iteration. The check is just a mask and compare on the existing 64-bit field, and it gets ~21% more iterations for free.
-
-**Ray-octant mirroring.** The coordinate system is mirrored to the negative ray octant at the start of traversal. With all ray direction components negative, finding the exit face of a cell simplifies to finding the minimum of three distances -- no conditionals to select which face based on ray sign. This is about 10% faster and simplifies the intersection code considerably.
-
----
-
-## How the Minecraft block voxelizer works
-
-This is the algorithm for turning Minecraft block models and textures into 16x16x16 voxel bricks. Every block state gets voxelized once, offline, by reading directly from the Minecraft client JAR. The output is a simple 16^3 grid of voxels per block state, pallete compressed to 256 different materials per block. Each voxel gets it's own material data including color, transparency, emmisivness, and diffuse.
-
-### Block states
-
-Minecraft represents blocks as block states. A block state is a block type plus a set of properties. `oak_stairs[facing=east,half=bottom,shape=straight]` is one block state. `oak_stairs[facing=west,half=top,shape=inner_left]` is a different one. Every unique combination gets its own numeric ID. The voxelizer runs over all of them in parallel, with each worker thread opening the JAR independently and keeping its own texture cache.
-
-### Finding the right model
-
-The JAR has a blockstate JSON for each block. There are two kinds.
-
-**Variant blocks** have a `variants` map. Keys are property filters like `"facing=east,half=bottom"`. You find the entry that matches the most properties and use that model.
-
-**Multipart blocks** (fences, walls, glass panes) have a `multipart` array. The difference here is that *all* matching entries apply, not just the best one. A fence post is one model, each connected arm is a separate model, and you composite them all together. The `when` conditions support pipe-separated alternatives like `"north": "low|tall"` meaning north=low OR north=tall, plus `OR` arrays for more complex cases.
-
-### Resolving the model
-
-Models can have a parent, so you walk the chain until you hit a builtin or run out. Texture references are merged from the whole chain, with child values winning over parent values. Texture names starting with `#` are variables, like `#all` or `#side`. You resolve them by looking them up in the merged texture map repeatedly until none start with `#` anymore.
-
-### Generating quads
-
-Each model is a list of elements. An element is a cuboid defined by `from` and `to` in [0,16]^3 space, with a face on each of its six sides.
-
-There are two model parts to worry about. Volumetric model parts and thin model parts.
-
-For a volumetric shape, you split it into a quad for each face, and shift the face inward toward by 0.5 voxels the center of the volume. You also clip off 0.5 voxels from all edges of each quad. This puts it inside the voxels it belongs to rather than sitting exactly on their boundary, which would cause the SAT test to miss it.
-
-Zero-thickness quads, like cross models for flowers or chains, get nudged 0.5 units instead, for the same reason. If the thin quad is at the edge of the block, you shift in inwards by 0.5 voxels. If the thin quad is inside the block, you shift it by 0.5 units away from the center of the block.
-
-Then element rotation is applied if the element JSON has a `rotation` block, followed by blockstate variant rotation: Y axis first, then X, both around the block center (8,8,8).
-
-UV conventions follow Blockbench's `CubeFace.UVToLocal()` exactly, which is the reference for how Minecraft renders models.
-
-### SAT intersection test
-
-For each quad, the voxelizer iterates over every voxel in the quad's bounding box and runs a Separating Axis Theorem test to see if they actually intersect. The test checks: the three world axes (X, Y, Z), the quad's own normal, and the 12 cross products of the four quad edges with the three world axes. If any axis separates the quad from the voxel AABB, they don't intersect.
-
-This is a strict test and it needs to be. For something like a chain model or a cross-shaped plant, the bounding box is much bigger than the actual geometry. Without SAT, you'd get a lot of solid voxels that shouldn't be there.
-
-### Texture sampling
-
-For voxels that pass SAT, the voxelizer samples the texture at the voxel center. To do that it undoes the blockstate rotation, undoes any element rotation, then computes the UV at that local position. UV rotation from the face JSON is applied too.
-
-There are special cases for water, foliage, grass, and leaves among other blocks that need to be tinted based on the biome. This is done identically to how minecraft hardcodes the tining, and assumes 15x15 biome blend is turned on.
-
-### Special cases
-
-Air returns an empty grid immediately.
-
-Fluids (water and lava) have no usable model in the JAR, so they're generated procedurally. We need to do the same thing.
-
-Waterlogged blocks get voxelized normally first, then every empty voxel gets filled with water.
-
-Animated textures are stored as vertically stacked frames in the PNG (height > width). Only the first frame is used.
-
-Block material data is hardcoded. Certain blocks are hardcoded to have certain roughness material values or emissive material values. For blocks that need a mirror surface, like glass, the whole block and all voxels in it (except for when waterlogged) are encoded to have that hardcoded roughness value. For blocks that need to be emissive, and emissive value is picked, and a brightness threshold. Only voxels in the block that are brighter than the threshold are set to be emissive.
-
----
-
-## Suggested project structure
-
-This is a guideline, not a specification. The actual layout will evolve as the project grows.
-
 ```
 lattice/
-  Cargo.toml                     # workspace root
+  Cargo.toml
 
   crates/
     lattice-dag/
-      Cargo.toml
       src/
-        lib.rs                   # Dag<T>, Level, LeafPool — world-scale arena
-        node.rs                  # node layout: interior, leaf, uniform
-        intern.rs                # hash-table node interning, global dedup tables
-        palette.rs               # palette encoding (u4/u8 indices, uniform flag)
+        lib.rs          # Dag, Level (SoA), MaterialLut
+        node.rs         # LEAF_FLAG and child entry helpers
+        voxel.rs        # Voxel struct and ColorPalette
 
     lattice-import/
-      Cargo.toml
       src/
-        lib.rs                   # shared VoxelBrick type, importer trait
-        minecraft/
-          mod.rs                 # minecraft importer entry point
-          region.rs              # .mca parsing, sector table, decompression
-          chunk.rs               # NBT decoding, block section extraction
-          block_states.rs        # block state string -> numeric ID mapping
-          bake/
-            mod.rs               # block model voxelizer entry point
-            jar.rs               # client JAR reader with decompression cache
-            blockstate.rs        # blockstate JSON parsing, variant/multipart resolution
-            model.rs             # model JSON parsing, parent chain resolution, quad gen
-            texture.rs           # PNG loading, animated texture handling, tint
-            voxelizer.rs         # SAT intersection, texture sampling, fluid generation
-          legacy.rs              # pre-1.13 numeric ID + metadata (TODO)
-        mesh/
-          mod.rs                 # triangle mesh voxelizer entry point
-          voxelize.rs            # SAT-based mesh-to-voxel conversion
-        voxel/
-          mod.rs                 # other voxel format converters
-
-    lattice-analyze/
-      Cargo.toml
-      src/
-        lib.rs                   # analysis entry point, AnalysisReport type
-        repetition.rs            # unique node counts per level, tree depth tuning
-        palette.rs               # palette size distributions per level
-        bricks.rs                # brick size / reuse tradeoff measurements
-        strategy.rs              # translates measurements into a TreeConfig per channel
+        lib.rs          # importer entry point, VoxelChunk output type
+        palette.rs      # k-means++ in OKLab space, texture sampling
+        gltf/
+          mod.rs        # glTF scene loading, chunk dispatch
+          mesh.rs       # mesh data extraction, triangle clipping to chunks
+          material.rs   # PBR material -> Voxel mapping
+          voxelizer.rs  # SAT intersection test, texture sampling, normal baking
 
     lattice-pack/
-      Cargo.toml
       src/
-        lib.rs                   # packing entry point, reads AnalysisReport
-        geometry.rs              # builds geometry DAG from VoxelBrick occupancy
-        color.rs                 # builds color DAG from VoxelBrick material data
-        lod.rs                   # LOD representation generation
-        serialize.rs             # .lattice file writing, header construction
+        lib.rs          # packing entry point
+        sort.rs         # k-way merge of sorted chunk streams (Morton order)
+        dag.rs          # bottom-up streaming DAG construction
+        materials.rs    # Dolonius material array, streamed to temp file
+        serialize.rs    # .lattice file writing, PSVDAG encoding
 
     lattice-load/
-      Cargo.toml
       src/
-        lib.rs                   # loader entry point
-        header.rs                # .lattice header parsing, TreeConfig reconstruction
-        stream.rs                # streaming and demand-load logic
-        lod.rs                   # LOD selection based on camera distance
-        upload.rs                # CPU -> GPU buffer upload for both DAGs
-        buffers.rs               # GPU buffer layout for geometry and material channels
+        lib.rs          # loader entry point
+        header.rs       # .lattice header parsing, section index
+        stream.rs       # PSVDAG DFS stream decoding, node index reconstruction
+        upload.rs       # CPU -> GPU buffer upload
 
     lattice-render/
-      Cargo.toml
       src/
-        lib.rs                   # renderer entry point
-        tracer.rs                # render loop, pass orchestration
-        camera.rs                # camera state, ray generation
-        traverse.rs              # geometry DAG traversal, positional material lookup
-        gi.rs                    # path traced indirect lighting, per-face accumulation
-        lod.rs                   # LOD-aware traversal decisions
-        debug.rs                 # debug overlay passes
+        lib.rs          # renderer entry point
+        tracer.rs       # render loop, pass orchestration
+        camera.rs       # camera state, ray generation
+        traverse.rs     # 64-tree traversal, Dolonius material lookup
+        gi.rs           # path tracing, per-face accumulation
+        debug.rs        # debug overlay passes
 
   shaders/
-    common.wgsl                  # shared math, type definitions
-    traverse.wgsl                # geometry DAG ray traversal, positional material lookup
-    primary.wgsl                 # primary ray dispatch
-    gi.wgsl                      # indirect lighting passes
-    accumulate.wgsl              # per-face GI accumulation, weighted update
-    debug.wgsl                   # debug overlays
+    common.wgsl         # shared math, type definitions
+    traverse.wgsl       # 64-tree DDA, Dolonius material index accumulation
+    primary.wgsl        # primary ray dispatch
+    gi.wgsl             # path tracing bounce loop
+    accumulate.wgsl     # per-face weighted GI accumulation
+    debug.wgsl          # debug overlays
 
   tools/
-    Cargo.toml
     src/
-      pack.rs                    # CLI: source -> .lattice
-      render.rs                  # CLI: .lattice -> frames (native)
-      inspect.rs                 # CLI: print .lattice header and stats
+      pack.rs           # CLI: glTF scene -> .lattice
+      render.rs         # CLI: .lattice -> frames
+      inspect.rs        # CLI: print .lattice header and stats
 ```
 
 ---
 
-## Key findings from research:
-- A 64-tree (otherwise known as a "contree") produces 37% fewer total nodes than an octree on Minecraft terrain. It's also faster to ray traverse through, especially when storing a coarse 8 bit occupancy mask along with the 64 bit mask.
-- Leaf-level deduplication is where almost all the savings happen. At the 4^3 leaf level, 77% of nodes are duplicates. At the 64^3 root level, it's 0.1%.
-- Culling (removing voxels surrounded on all 6 sides by opaque blocks) eliminates 88% of solid voxels before any other compression runs. This has a bigger impact than any encoding choice.
-- Stacked palettes (chunk-level, region-level, tile-level) compress attribute data well. The biggest win is the inline tile palette at 4^3 scope. A 1024^3 chunk palette for pointers worked well for minecraft worlds, since each 64^3 chunk of minecraft blocks usually contains only around 100 unique blocks, which is 100 unique leaf brick pointers.
-- Geometry and material are stored in two completely separate DAGs. Stripping material from the geometry DAG dramatically increases dedup — identical shapes with different materials share geometry nodes. After geometry traversal finds the hit point, the material DAG is traversed by 3D position: cheap positional descent, no ray math, terminates early on LEAF_FLAG for uniform regions. Interior nodes in the material DAG store a representative (mode) material for free via SoA layout, enabling zero-cost LOD at any traversal depth.
-- PSVDAG-style depth-first linearization removes all pointers from the disk format, achieving 2.8-3.8x compression over pointer-based SVDAG. The loader reconstructs pointer indices for runtime use. This is the right split: compact on disk, fast at runtime.
-- The ancestor stack is the single highest-impact traversal optimization. Benchmarks on a 4K Bistro scene show 16903 cycles/ray without it, 8896 with it (~2x). The 2x2x2 sub-block coalescing adds another ~21%, and ray-octant mirroring adds ~10% on top of that. These stack and should all be in from the start.
-- PSVDAG compresses pointer-based SVDAG by 2.8-3.8x. For Lattice this applies to the disk format. The runtime format keeps indices for fast GPU access.
+## Key findings from research
+
+- A 64-tree produces 37% fewer total nodes than an octree on the same scene and traverses faster, especially with the 64-bit occupancy mask enabling sub-block coalescing.
+- Geometry-only DAG deduplication with the Dolonius attribute method adds about 1% to DAG size compared to a pure geometry DAG. Per-pointer attribute methods (Dado et al.) add about 2x. For path tracing where traversal dominates, the Dolonius approach is the right call.
+- Leaf-level deduplication is where almost all savings happen. At the 4^3 level, 77% of nodes are duplicates. At the 64^3 level, 0.1%.
+- The ancestor stack is the highest-impact traversal optimization (~2x). Sub-block coalescing adds ~21%, ray-octant mirroring adds ~10%.
+- PSVDAG-style encoding achieves 2.8-3.8x smaller files than pointer-based SVDAG.
 
 ---
 
@@ -510,6 +396,3 @@ lattice/
 | [Voxel.Wiki](https://voxel.wiki) | Community wiki, good starting hub for voxel rendering resources |
 | [Voxely.net blog](https://voxely.net/blog/) | John Lin's blog on voxel engine design |
 | [Jacco's voxel blog series](https://jacco.ompf2.com) | Practical renderer tutorials with OpenCL |
-
-
-Most of the time, the scene isnt going to be uniform material, but instead will be a uniform complex material tiled across the entire area. For example, underground there's lots of stone blocks. Each stone block has a bunch of colors in it, but across a big underground patch, there's certainly many different colors, but if we store the material in some sort of pointer type thing, we can have each stone block be a material pointer, and then the entire underground patch is also a pointer and
