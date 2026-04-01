@@ -1,24 +1,33 @@
 use std::path::Path;
 use gltf;
 
-mod mesh;
-mod material;
-mod voxelizer;
+use crate::import::palette;
 
-fn import_gltf(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-  let (document, buffers, images) = gltf::import("scenes/bistro.glb")?;
+pub mod mesh;
+pub mod material;
+pub mod voxelizer;
+
+pub fn import_gltf(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+  print!("Loading GLTF...");
+  let (document, _buffers, images) = gltf::import(path)?;
+  println!("Done.");
+  let image_pixels: Vec<Vec<[u8; 3]>> = document
+    .textures()
+    .filter_map(|texture| {
+      let image_data = images.get(texture.source().index())?;
+      let pixels = image_data.pixels
+        .chunks_exact(bytes_per_pixel(image_data.format))
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
+      Some(pixels)
+    })
+    .collect();
+
+  let image_slices: Vec<&[[u8; 3]]> = image_pixels.iter().map(Vec::as_slice).collect();
   
-  for texture in document.textures() {
-    let name = texture.name().unwrap_or("unnamed");
-    println!("Texture: {}", name);
+  println!("Collected all image textures, building palette...");
 
-    let image = texture.source();
-    if let Some(image_data) = images.get(image.index()) {
-      let bpp = bytes_per_pixel(image_data.format);
-      
-    }
-  }
-
+  println!("{:?}", palette::build_palette_from_images(&image_slices));
   Ok(())
 }
 

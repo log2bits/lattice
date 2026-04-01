@@ -1,2 +1,2 @@
-mod palette;
-mod gltf;
+pub mod palette;
+pub mod gltf;
