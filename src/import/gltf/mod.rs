@@ -8,27 +8,28 @@ pub mod material;
 pub mod voxelizer;
 
 pub fn import_gltf(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-  print!("Loading GLTF...");
-  let (document, _buffers, images) = gltf::import(path)?;
-  println!("Done.");
-  let image_pixels: Vec<Vec<[u8; 3]>> = document
-    .textures()
-    .filter_map(|texture| {
-      let image_data = images.get(texture.source().index())?;
-      let pixels = image_data.pixels
-        .chunks_exact(bytes_per_pixel(image_data.format))
-        .map(|c| [c[0], c[1], c[2]])
-        .collect();
-      Some(pixels)
-    })
-    .collect();
+  // print!("Loading GLTF...");
+  // let (document, _buffers, images) = gltf::import(path)?;
+  // println!("Done.");
+  // let image_pixels: Vec<Vec<[u8; 3]>> = document
+  //   .textures()
+  //   .filter_map(|texture| {
+  //     let image_data = images.get(texture.source().index())?;
+  //     let pixels = image_data.pixels
+  //       .chunks_exact(bytes_per_pixel(image_data.format))
+  //       .map(|c| [c[0], c[1], c[2]])
+  //       .collect();
+  //     Some(pixels)
+  //   })
+  //   .collect();
 
-  let image_slices: Vec<&[[u8; 3]]> = image_pixels.iter().map(Vec::as_slice).collect();
+  // let image_slices: Vec<&[[u8; 3]]> = image_pixels.iter().map(Vec::as_slice).collect();
   
-  println!("Collected all image textures, building palette...");
+  // println!("Collected all image textures, building palette...");
 
-  println!("{:?}", palette::build_palette_from_images(&image_slices));
-  Ok(())
+  // println!("{:?}", palette::build_palette_from_images(&image_slices));
+  // Ok(())
+  todo!()
 }
 
 

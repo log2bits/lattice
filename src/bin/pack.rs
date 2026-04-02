@@ -1,6 +1,6 @@
 use std::path::Path;
-use lattice::import::gltf::import_gltf;
+use lattice::import::palette;
 
 fn main() {
-  import_gltf(Path::new("scenes/bistro.glb"));
+  palette::generate(256);
 }
