@@ -19,9 +19,9 @@ Each stage is independent. The handoff between stages is a well-defined data str
 
 ## Design choices that are fixed
 
-- Each level of the tree is one of three layer types: Geometry DAG, Standard DAG, or RAW. No other layer types.
+- Each level of the tree is one of three layer types: Geometry DAG, Material DAG, or Grid. No other layer types.
 - Every level uses SoA layout. No AoS.
-- LUT compression is optional and independent per level.
+- All voxel references resolve through the global voxel LUT to a fixed 32-bit format. Per-section-root LUTs and pool-size bitpacking compress the intermediate indices. The `Lut<T>` + `BitpackedArray` primitives are reused for all of these.
 - The renderer is always full path tracing. No rasterization fallback, no hybrid primary visibility.
 - Face normals are derived from the DDA exit face at traversal time. No per-voxel normals are stored.
 - No LOD. Every ray traverses to the leaf.
@@ -35,21 +35,21 @@ Every child entry everywhere in the tree is a u32. Bit 31 (LEAF_FLAG) is always 
 
 ### Geometry DAG
 
-A geometry DAG level deduplicates on geometry only. Two nodes with the same occupancy pattern but different materials hash the same and share a node. Material data lives in a separate flat array, indexed by a running count the ray maintains during traversal. This is the Dolonius method: each descent step adds the `voxel_count` of skipped sibling subtrees to a running offset, so when a leaf is hit, that offset points directly into the flat material array.
+A geometry DAG level deduplicates on geometry only. Two nodes with the same occupancy pattern but different materials hash the same and share a node. Material data lives in a separate flat array called the materials array, indexed by a running count the ray maintains during traversal. This is the Dolonius method: each descent step adds the `voxel_count` of skipped sibling subtrees to a running offset, so when a leaf is hit, that offset points directly into the materials array.
 
-Uniform subtrees (LEAF_FLAG set) don't contribute to the material array and don't advance the running count. Their material either sits inline in the child entry or is handled by the level above.
+Uniform subtrees (LEAF_FLAG set) don't contribute to the materials array and don't advance the running count. Their material either sits inline in the child entry or is handled by the level above.
 
 This layer type is right for scenes with lots of geometric repetition and varied materials. The DAG stays tight in cache because it carries no material payload.
 
-### Standard DAG
+### Material DAG
 
-A standard DAG level deduplicates on geometry and material together. Two nodes only share a node if both their occupancy and their leaf data match exactly. Material data is inline in the leaf entries, not in a separate flat array.
+A material DAG level deduplicates on geometry and material together. Two nodes only share a node if both their occupancy and their leaf data match exactly. Material data is inline in the leaf entries, not in a separate flat array.
 
 This is right for the bottom levels of scenes where material variation is low and you want the DAG to capture both geometric and material repetition. A Minecraft chunk is a good example since most blocks are a single material with low variation.
 
-### RAW
+### Grid
 
-A RAW level is just a flat 3D grid of u32 child entries. No tree structure, no deduplication. Each entry either points to a sub-DAG in the level below or is empty. RAW is right for the top of the hierarchy where deduplication almost never fires, and it avoids tree traversal overhead in regions that are nearly all unique.
+A grid level is just a flat 3D array of u32 child entries. No tree structure, no deduplication. Each entry either points to a sub-DAG in the level below or is empty. Grid is right for the top of the hierarchy where deduplication almost never fires, and it avoids tree traversal overhead in regions that are nearly all unique.
 
 ---
 
@@ -58,7 +58,7 @@ A RAW level is just a flat 3D grid of u32 child entries. No tree structure, no d
 Every level stores its fields in Structure of Arrays layout. All fields are stored in separate contiguous arrays, each indexed by node index.
 
 - `occupancy: [u64]` -- one bit per child slot. A 1 bit means a child exists there.
-- `voxel_count: [u32]` -- total Dolonius MAT entries contributed by this subtree. Only present on Geometry DAG levels. Uniform subtrees contribute 0.
+- `voxel_count: [u32]` -- total materials array entries contributed by this subtree. Only present on Geometry DAG levels. Uniform subtrees contribute 0.
 - `children_start: [u32]` -- where this node's children begin in the flat children array.
 - `children: [u32]` -- packed child entries for all nodes at this level, laid out contiguously.
 
@@ -68,72 +68,101 @@ SoA layout matters for GPU traversal. A warp of 32 threads reading `occupancy` f
 
 ---
 
+## Sections
+
+A section is a consecutive group of levels sharing the same layer type. Sections are the unit of LUT ownership: each section root gets its own LUT covering all leaf child entries within its subtree.
+
+The Minecraft configuration has three sections:
+
+```
+Section 1: Grid         (1 level)   -- spatial index into block DAGs
+Section 2: Geometry DAG (3 levels)  -- block geometry dedup across the world
+Section 3: Material DAG (2 levels)  -- voxel color dedup within each block
+```
+
+Expressed in code:
+
+```rust
+let lattice = Lattice::new(&[
+    SectionConfig::grid(1),
+    SectionConfig::geometry_dag(3).with_lut(),
+    SectionConfig::material_dag(2).with_lut(),
+]);
+```
+
+Child pointers within a section (level N to level N+1) use pool-size bitpacking: after construction, the node pool at each level is a dense sequential array, so the minimum power-of-two bit width to address it is computed and all entries are repacked. No LUT table is needed.
+
+Child entries at the bottom of a section are global voxel LUT indices. These get per-section-root LUT compression: each section root builds a small local LUT of the unique global voxel LUT indices its subtree references, stores those as bitpacked local indices, and the local LUT entries are the global indices. Different section roots reference small disjoint subsets of the global voxel LUT, so local bit widths are much narrower than the global index width.
+
+---
+
 ## LUT compression
 
-LUT compression reduces the bit width of child entries at the bottom layer of any level by replacing full u32 values with short indices into a lookup table of unique values. It applies per tree root, not per level globally. So if a level contains 64 independent trees, each tree gets its own LUT.
+The core primitive is a `BitpackedArray`: a flat array of values stored at a fixed power-of-two bit width (1, 2, 4, 8, 16, or 32). Powers of two mean the GPU extracts any entry with a single shift and mask. `BitpackedArray` supports converting its bit width after construction, which is how both compression strategies finalize their storage: build with full u32 values, determine the minimum bit width once sizes are known, repack.
 
-### Why per tree root
+On top of `BitpackedArray` is a generalized `Lut<T>`: a flat array of unique values of type `T`, plus a `BitpackedArray` of indices into those values. This pattern appears four times in the structure:
 
-The LUT belongs to a tree, not to a level. This matters because of how DAG deduplication interacts with LUT compression. In the Minecraft example, even though the world contains millions of block instances, the block pool only contains a few thousand unique blocks after dedup. Each unique block has exactly one LUT, shared by all instances of that block everywhere in the world via the DAG node sharing. LUT memory scales with unique content, not scene size.
+1. **DAG node pools** -- each node pool is a set of unique nodes; intra-section child pointers are bitpacked indices into it. The pool IS the value table. No separate index array is needed since the pool indices are already sequential.
+2. **Global voxel LUT** -- all unique 32-bit voxels in the scene, deduplicated across all sections. Everything ultimately resolves to an index into this table.
+3. **Per-section-root LUT** -- for each section root, a local table of the unique global voxel LUT indices its subtree references. In-tree leaf entries are bitpacked local indices into this table.
+4. **Materials array LUT** -- for Geometry DAG sections, the Dolonius materials array is bitpacked global voxel LUT indices. A small LUT of unique global indices maps the compressed stream entries to actual voxel data.
 
-### Construction algorithm
+### Pool-size packing
 
-LUT compression is built during tree construction, not as a separate post-process pass. As child entries are added to a tree, a hashmap tracks every unique u32 value seen. When a new unique value is encountered, it gets appended to the LUT. The child entry stored in the tree is always a u32 index into the LUT rather than the raw value directly.
+After construction, the node pool for each level is a dense sequential array. The pool size determines the bit width. Every intra-section child pointer at that level is repacked at that width. No LUT table is needed since the pool itself is the value set.
 
-At this stage, all indices are full u32 values. The LUT is just a flat array of unique u32s.
+### Global voxel LUT
 
-Once the tree is fully constructed, the LUT length is known. The minimum power-of-two bit width needed to address all entries is computed (1, 2, 4, 8, or 16 bits). All the u32 indices in the tree's child entries are then repacked into a custom bitpacked array at that width. Powers of two are required so the GPU can extract an index with a single bit shift and mask.
+All unique 32-bit voxels in the scene are collected into a single flat table during packing. The table size determines a single global bit width, `voxel_bits`, that is stored in the file header. All materials array entries and all per-section-root LUT entries use this bit width.
 
-Because the bit width changes during repacking, a custom bitpacked array type handles the storage. It supports converting its internal width after the fact, which is the operation that makes repacking straightforward.
+### Per-section-root LUT
 
-### LUT size and bit widths
+At the bottom of a section, each section root gets a local table of the unique global voxel LUT indices within its subtree. In-tree leaf entries are bitpacked local indices into this table. The local table size determines a per-root bit width that is typically much narrower than `voxel_bits`.
+
+The local table is owned by the section root node and shared by all instances through DAG node sharing. LUT memory scales with unique content, not scene size. In the Minecraft geometry section, the global voxel LUT might have ~10,000 entries (14 bits), but each block chunk's local table has ~100 entries (7 bits).
+
+### Materials array
+
+For Geometry DAG sections, the materials array stores one global voxel LUT index per non-uniform leaf in Dolonius DFS order. The entries are bitpacked at `voxel_bits`. A small local LUT of unique indices within the materials array can compress further if the section's voxel variety is low.
+
+### Bit widths
 
 ```
-LUT entry count    ->    index bit width
-1                         1 bit
-2 - 3                     2 bits
-4 - 15                    4 bits
-16 - 255                  8 bits
-256 - 65535               16 bits
-65536+                    no compression (store raw u32)
+Entry count    ->    bit width
+1                    1 bit
+2-3                  2 bits
+4-15                 4 bits
+16-255               8 bits
+256-65535            16 bits
+65536+               32 bits (no benefit, store raw)
 ```
-
-The bit width for each tree's LUT is stored in the section data alongside the LUT itself. The GPU reads it once per tree root and uses it for all child entry lookups within that tree.
-
-### What gets compressed
-
-LUT compression applies to the bottom layer of the level it's configured on. Upper layers within the same level still use raw u32 node indices, since those are structural pointers and their range is determined by the node pool size, not the number of unique values. Only the leaf values at the bottom of the tree benefit from LUT compression, since that's where the value space is small and enumerable.
 
 ---
 
-## Voxel payloads
+## Voxel format
 
-The voxel payload format varies by scene and is fully described in the `.lattice` header. The header stores the bit layout so the GPU knows how to decode a leaf value: where the color index is, where roughness is, where the flag bits are, and how wide the total payload is. The shader reads this once as uniforms and uses them for every hit. No separate shader variant is needed per scene.
-
-For a scene like the Bistro, the payload is 16 bits:
+Every voxel in every scene uses the same 32-bit layout:
 
 ```
-Voxel (16 bits):
+Voxel (32 bits):
 
-  bit  15     reserved
-  bit  14     transparent  refracts rather than reflects
-  bit  13     metallic     conductor, albedo tints specular
-  bit  12     emissive     emits light at its albedo color
-  bits 11-8   roughness    nibble, 0 = mirror, 15 = fully diffuse
-  bits  7-0   palette      index into the global 256-entry color palette
+  bits 31-8   rgb          24-bit linear RGB color
+  bits  7-4   roughness    nibble, 0 = mirror, 15 = fully diffuse
+  bit   3     emissive     emits light at its albedo color
+  bit   2     metallic     conductor, albedo tints specular
+  bit   1     transparent  refracts rather than reflects
+  bit   0     reserved
 ```
 
-For a scene like a Minecraft world where you want a full 24-bit color, the payload is 32 bits with a different layout. The traversal code doesn't care. It just reads the layout from the header uniforms and extracts fields with bit shifts.
-
-Because payload size varies per scene, the material array entry size varies too. Bistro uses 16-bit entries, Minecraft uses 32-bit. The header stores this so the loader reads the MAT section correctly.
+The shader always decodes the same layout. No per-scene variants, no header fields for field offsets. All references to voxel data in the tree are indices into the global voxel LUT, which stores the full 32-bit values.
 
 ---
 
-## The global color palette
+## The color palette
 
-The color palette for model imports is a fixed global 256-entry table, precomputed once as a perceptually uniform spread across OKLab space. It doesn't change between scenes. OKLab is perceptually uniform, so a uniform spread minimizes worst-case visible error for any input color. The palette is 768 bytes and stays in L1 cache permanently once uploaded.
+The color palette is a perceptually uniform 256-entry spread across OKLab space, precomputed using sample elimination. It doesn't change between scenes. At import, each sampled surface point maps to its nearest palette entry, which sets the 24-bit RGB field of the voxel.
 
-At import time, each sampled surface point maps to its nearest palette entry. Scenes that use the 8-bit palette color field in their voxel payload get this automatically.
+Using the palette keeps the global voxel LUT small. With 256 possible colors and a handful of material flag combinations, the total unique voxel count is bounded and typically sits in the low thousands. A smaller global voxel LUT means smaller `voxel_bits`, which reduces the cost of every per-section-root LUT entry and every materials array entry across the entire scene.
 
 ---
 
@@ -141,23 +170,33 @@ At import time, each sampled surface point maps to its nearest palette entry. Sc
 
 ### Bistro
 
-The Bistro is a dense architectural scene with lots of geometric repetition but varied materials. Colors are snapped to the global 256-entry color palette at import. There are potentially thousands of unique voxel payloads globally (up to 2^15 in theory given 256 colors and the material flag bits), but any individual tree usually has far fewer. Per-tree LUT compression often brings most trees down to 8-bit or fewer indices.
+The Bistro is a dense architectural scene with lots of geometric repetition but varied materials. Colors are quantized to the 256-entry palette at import, bounding the global voxel LUT to a few thousand entries. `voxel_bits` typically lands at 16.
 
-A typical configuration:
+```rust
+let lattice = Lattice::new(&[
+    SectionConfig::grid(1),
+    SectionConfig::geometry_dag(3).with_lut(),
+]);
+```
 
-- Top level: RAW flat grid acting as a spatial index into the DAG trees below. No LUT compression since large regions are mostly unique.
-- Middle levels: Geometry DAG. Each tree root gets its own LUT. After construction, the LUT is checked and indices are repacked to the minimum bit width. Most trees compress to 8 bits or fewer.
-- Material data: flat MAT array of 16-bit voxel payloads in Dolonius DFS order.
+- Section 1, Grid (1 level): spatial index into the geometry DAG trees below.
+- Section 2, Geometry DAG (3 levels): deduplicates block geometry. Material data lives in the materials array in Dolonius DFS order, bitpacked at `voxel_bits`. Each section root gets a local LUT of the global voxel LUT indices its subtree references. Most trees only touch a small slice of the global table so local indices compress to 8 bits or fewer.
 
 ### Minecraft world
 
 A Minecraft world has a two-tier structure. Each block is a small voxel DAG. The world is a large DAG of blocks.
 
-A typical configuration:
+```rust
+let lattice = Lattice::new(&[
+    SectionConfig::grid(1),
+    SectionConfig::geometry_dag(3).with_lut(),
+    SectionConfig::material_dag(2).with_lut(),
+]);
+```
 
-- Top level: RAW flat grid of 64^3 chunk pointers. 64^3 regions of a Minecraft world are almost never identical so dedup doesn't help here.
-- Middle levels: Geometry DAG with LUT compression. Deduplicates block geometry across the world. Most 64^3 regions only use around 100 unique block configurations so LUT indices compress to 8 bits. Because the block DAGs are deduplicated, the number of LUTs equals the number of unique blocks, not the number of block instances. A sandstone block appearing a million times has one LUT shared by all million instances.
-- Bottom levels: Standard DAG with LUT compression. Deduplicates voxel geometry and material together within each block. Individual block trees usually have very few unique voxel types so LUT indices often compress to 4 bits.
+- Section 1, Grid (1 level): spatial index of 64^3 chunk pointers. 64^3 regions are almost never identical so dedup doesn't help here.
+- Section 2, Geometry DAG (3 levels): deduplicates block geometry across the world. The global block pool has ~10,000 unique block types, but each chunk only references ~100, so per-section-root LUT compresses geometry section leaf entries to 7 bits. Because block DAGs are deduplicated, the number of LUTs equals the number of unique block types, not block instances. A sandstone block appearing a million times has one LUT.
+- Section 3, Material DAG (2 levels): deduplicates voxel data within each block. Each block uses fewer than 256 unique colors, so the global voxel LUT has at most a few thousand entries and `voxel_bits` is 16. Each block's per-section-root local LUT has fewer than 16 entries, so in-tree leaf entries compress to 4 bits. That's a 4x reduction from `voxel_bits` and an 8x reduction from raw 32-bit voxels.
 
 The raw voxel count for a full Minecraft world is astronomical, but after two levels of dedup the actual node count sits in the millions. The whole thing fits in a few GB. u32 indices are fine throughout since dedup means you're counting unique subtrees, not individual voxels.
 
@@ -167,9 +206,9 @@ The raw voxel count for a full Minecraft world is astronomical, but after two le
 
 ### Finding the hit
 
-The ray traverses the tree level by level. At each node, the occupancy mask tells the shader which children exist. Empty children are skipped immediately. The layer type of the current level tells the shader how to handle a leaf: Geometry DAG levels do a Dolonius material lookup at hit time, Standard DAG levels read the payload inline from the child entry, RAW levels follow the pointer to the next level.
+The ray traverses the tree level by level. At each node, the occupancy mask tells the shader which children exist. Empty children are skipped immediately. The layer type of the current level tells the shader how to handle a leaf: Geometry DAG levels do a Dolonius materials array lookup at hit time, Material DAG levels decode the child entry through the per-section-root LUT to get a global voxel LUT index, then read the 32-bit voxel from the global table. Grid levels follow the pointer to the next level.
 
-If a level has LUT compression, the child entry is first decoded through that tree's LUT before being used. The LUT is small and cache-resident so this adds no meaningful cost.
+Intra-section child pointers are decoded with a single shift and mask using the level's fixed bit width. At section boundaries, leaf entries are decoded through the section root's LUT before being used. The LUT is small and cache-resident so this adds no meaningful cost.
 
 An ancestor stack caches parent node indices so the ray doesn't re-descend from root on every step. For Geometry DAG levels, the stack also carries the running Dolonius material base offset, updated by one addition per descent step.
 
@@ -217,59 +256,68 @@ PSVDAG achieves 2.8-3.8x smaller files than pointer-based SVDAG. Every repeated 
 
 ```
 Header:
-  magic:          [u8; 4]     "LTCE"
-  version:        u16
-  flags:          u16
-  world_min:      [i64; 3]    voxel-space coordinates
-  world_max:      [i64; 3]
-  num_levels:     u8
-  payload_bits:   u8          total bit width of a voxel payload (16 or 32)
-  payload_layout: u32         packed description of payload field offsets and widths
-  mat_entry_size: u8          bytes per MAT array entry (2 or 4)
-  _pad:           [u8; 3]
-  levels:         [LevelDesc; num_levels]
-  section_count:  u32
-  sections:       [{tag: u32, offset: u64, size: u64}; section_count]
+  magic:           [u8; 4]     "LTCE"
+  version:         u16
+  flags:           u16
+  world_min:       [i64; 3]    voxel-space coordinates
+  world_max:       [i64; 3]
+  num_sections:    u8
+  num_levels:      u8          total levels across all sections
+  voxel_bits:      u8          bit width for global voxel LUT indices (1/2/4/8/16/32)
+  _pad:            u8
+  sections:        [SectionDesc; num_sections]
+  levels:          [LevelDesc; num_levels]
+  chunk_count:     u32
+  chunks:          [{tag: u32, offset: u64, size: u64}; chunk_count]
+
+SectionDesc:
+  layer_type:      u8          0 = Grid, 1 = Geometry DAG, 2 = Material DAG
+  lut_enabled:     u8          0 = no per-section-root LUT, 1 = enabled
+  num_levels:      u8          number of levels in this section
+  _pad:            u8
 
 LevelDesc:
-  layer_type:     u8          0 = RAW, 1 = Geometry DAG, 2 = Standard DAG
-  lut_enabled:    u8          0 = no LUT compression on this level, 1 = enabled
-  _pad:           [u8; 2]
+  child_bits:      u8          bit width for intra-section child pointers (1/2/4/8/16/32)
+  _pad:            [u8; 3]
 ```
 
-Section tags:
+Chunks:
 
 ```
-0x4C564C**  LVL*    one section per tree level (* = level index, 0 = root)
+LVL*    one chunk per tree level (* = level index, 0 = root)
   node_count:       u32
-  occupancy:        [u64; node_count]       SoA field
-  voxel_count:      [u32; node_count]       SoA field, Geometry DAG levels only
-  children_start:   [u32; node_count]       SoA field
-  children:         [u32; total_children]   bitpacked if LUT enabled for this level
-                    encoded in PSVDAG DFS order
+  occupancy:        [u64; node_count]          SoA field
+  voxel_count:      [u32; node_count]          SoA field, Geometry DAG levels only
+  children_start:   [u32; node_count]          SoA field
+  children:         [u8; ...]                  intra-section child pointers, bitpacked
+                                               at child_bits, PSVDAG DFS order
 
-  if lut_enabled:
-    tree_count:     u32
-    trees:          [TreeLutDesc; tree_count]
+SEC*    one chunk per section with lut_enabled (* = section index)
+  root_count:       u32
+  roots:            [SectionRootDesc; root_count]
 
-TreeLutDesc:
+SectionRootDesc:
   root_node_index:  u32
-  lut_bits:         u8        actual index bit width used (1/2/4/8/16)
+  lut_index_bits:   u8          per-root bit width for in-tree leaf entries (1/2/4/8/16/32)
   _pad:             [u8; 3]
   lut_entry_count:  u32
-  lut_entries:      [u32; lut_entry_count]   full u32 values before compression
-  children_offset:  u64       byte offset into this level's children array
-                              where this tree's bitpacked indices begin
+  lut_entries:      [u32; lut_entry_count]     global voxel LUT indices
+  leaf_offset:      u64         byte offset into the bottom level's children array
+                                where this root's bitpacked leaf entries begin
 
-0x4D415400  MAT     flat material array (Dolonius DFS order, Geometry DAG levels only)
+MATL    one chunk per Geometry DAG section -- the Dolonius materials array
   entry_count:  u32
-  entries:      [u16 or u32; entry_count]   size set by mat_entry_size in header
+  entries:      [u8; ...]       global voxel LUT indices, bitpacked at voxel_bits
 
-0x50414C00  PAL     global color palette
-  entry_count:  u32                         always 256
-  entries:      [[u8; 3]; 256]              linear RGB, perceptually uniform OKLab spread
+VOXL    global voxel LUT
+  entry_count:  u32
+  entries:      [u32; entry_count]   32-bit voxel values
 
-0x53504958  SPIX    spatial index
+PAL     global color palette
+  entry_count:  u32                  always 256
+  entries:      [[u8; 3]; 256]       linear RGB, perceptually uniform OKLab spread
+
+SPIX    spatial index
   entry_count:  u32
   entries:      [{pos: [i32; 3], root_node_index: u32}; entry_count]
 ```
@@ -283,11 +331,12 @@ lattice/
   Cargo.toml
 
   src/
-    dag/
-      mod.rs          # Dag, Level (SoA), layer type definitions
+    lattice/
+      mod.rs          # Lattice, SectionConfig, LevelConfig, Level (SoA), layer type definitions
       node.rs         # LEAF_FLAG and child entry helpers
-      voxel.rs        # voxel payload description, ColorPalette
-      bitpacked.rs    # custom bitpacked array type, width conversion
+      voxel.rs        # Voxel (32-bit format), ColorPalette
+      bitpacked.rs    # BitpackedArray -- fixed-width packed storage, width conversion
+      lut.rs          # Lut<T> -- unique value table + BitpackedArray of indices
 
     import/
       mod.rs          # importer entry point, VoxelChunk output type
@@ -302,8 +351,8 @@ lattice/
       mod.rs          # packing entry point
       sort.rs         # k-way merge of sorted chunk streams (Morton order)
       dag.rs          # bottom-up streaming DAG construction, layer type dispatch
-      lut.rs          # per-tree LUT construction, hashmap dedup, bitwidth selection, repacking
-      materials.rs    # Dolonius material array, streamed to temp file
+      lut.rs          # global voxel LUT construction, per-section-root LUT construction
+      materials.rs    # Dolonius materials array, streamed to temp file, bitpacked at voxel_bits
       serialize.rs    # .lattice file writing, PSVDAG encoding
 
     load/
