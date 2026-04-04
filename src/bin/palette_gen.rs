@@ -763,7 +763,7 @@ fn generate_hald_clut(palette_labs: &[[f32; 3]], palette_rgb: &[[u8; 3]]) {
   for (x, y, [r, g, b]) in pixels {
     img.put_pixel(x, y, image::Rgb([r, g, b]));
   }
-  img.save("palette_lut.png")
+  img.save("assets/colors/palette_lut.png")
     .expect("failed to save palette_lut.png");
   eprintln!("Saved palette_lut.png.");
 }
@@ -813,13 +813,13 @@ pub fn generate(size: usize, order: &[u32]) -> Vec<[u8; 3]> {
   let labs: Vec<[f32; 3]> = colors.iter().map(|&rgb| lut[rgb_idx_flat(rgb)]).collect();
   let layout = som_layout(&labs);
 
-  let path = "palette.png";
+  let path = format!("assets/colors/palette_{}.png", size);
   let mut img = image::RgbImage::new(side as u32, side as u32);
   for (pos, &idx) in layout.iter().enumerate() {
     let [r, g, b] = colors[idx];
     img.put_pixel((pos % side) as u32, (pos / side) as u32, image::Rgb([r, g, b]));
   }
-  img.save(path).expect("failed to save palette.png");
+  img.save(&path).expect("failed to save palette.png");
 
   let saved = image::open(path)
     .expect("failed to re-open palette.png")
@@ -878,7 +878,7 @@ fn main() {
   match mode {
     "elim" => {
       let order = closest_pair_second_nn_elimination();
-      write_elimination_image(&order, "elimination.png");
+      write_elimination_image(&order, "assets/colors/palette_generator.png");
     }
 
     "palette" => {
@@ -888,9 +888,9 @@ fn main() {
         .parse()
         .expect("N must be a positive integer");
 
-      eprintln!("Loading elimination.png...");
-      let img = image::open("elimination.png")
-        .expect("elimination.png not found -- run 'elim' first")
+      eprintln!("Loading palette_generator.png...");
+      let img = image::open("assets/colors/palette_generator.png")
+        .expect("assets/colors/palette_generator.png not found -- run 'elim' first")
         .into_rgb8();
 
       let order: Vec<u32> = img
@@ -909,7 +909,7 @@ fn main() {
         .expect("N must be a positive integer");
 
       let order = closest_pair_second_nn_elimination();
-      write_elimination_image(&order, "elimination.png");
+      write_elimination_image(&order, "assets/colors/palette_generator.png");
       generate(n, &order);
     }
 
