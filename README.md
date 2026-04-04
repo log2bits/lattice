@@ -1,14 +1,14 @@
 # Lattice
 
-A voxel renderer with full path tracing. Lattice voxelizes a glTF scene, compresses the geometry into a sparse voxel DAG, stores material data in a separate flat array using the Dolonius method, and renders via GPU path tracing.
+A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses the geometry into a sparse voxel DAG, and renders via GPU path tracing. The tree structure is modular: each level of the hierarchy can be a different layer type, and LUT compression can be applied independently at any level. The header of a `.lattice` file fully describes the structure, so the traversal just follows those instructions at runtime.
 
 ---
 
 ## Pipeline
 
 ```
-[import]   glTF scene -> sorted (position, voxel) stream
-[pack]     sorted voxel stream -> geometry DAG + material array -> .lattice file
+[import]   scene -> sorted (position, voxel) stream
+[pack]     sorted voxel stream -> layered DAG + material data -> .lattice file
 [load]     .lattice file -> GPU-ready buffers
 [render]   GPU buffers -> path traced image
 ```
@@ -19,116 +19,147 @@ Each stage is independent. The handoff between stages is a well-defined data str
 
 ## Design choices that are fixed
 
-- The runtime tree structure is always a **64-tree** (4x4x4 branching per node). No octree mode.
-- The renderer is always **full path tracing**. No rasterization fallback, no hybrid primary visibility.
-- The entire scene is one single DAG. No per-region trees, no separate geometry table.
-- Geometry and material data are stored separately. The DAG is geometry-only; materials live in a flat array indexed by the Dolonius voxel-count method.
+- Each level of the tree is one of three layer types: Geometry DAG, Standard DAG, or RAW. No other layer types.
+- Every level uses SoA layout. No AoS.
+- LUT compression is optional and independent per level.
+- The renderer is always full path tracing. No rasterization fallback, no hybrid primary visibility.
+- Face normals are derived from the DDA exit face at traversal time. No per-voxel normals are stored.
 - No LOD. Every ray traverses to the leaf.
 - No editing during rendering. The data is built once and uploaded. Read-only at runtime.
 
 ---
 
-## Voxelization pipeline
+## The three layer types
 
-Voxelization is split from DAG construction. The voxelizer produces a sorted stream of `(position, voxel)` pairs; the packer consumes that stream and builds the DAG. This separation keeps memory bounded and makes the two stages independently testable.
+Every child entry everywhere in the tree is a u32. Bit 31 (LEAF_FLAG) is always the same: set means this is a leaf, clear means it's a pointer to the next level's node pool. What the remaining bits mean depends on the layer type, which the header tells you.
 
-### Color palette first
+### Geometry DAG
 
-Before voxelizing any geometry, the importer samples all textures in the glTF and runs k-means++ clustering in OKLab space to produce a 256-color palette. OKLab is perceptually uniform, so k-means minimizes visible banding. The full palette is 768 bytes. It stays in L1 cache permanently once uploaded.
+A geometry DAG level deduplicates on geometry only. Two nodes with the same occupancy pattern but different materials hash the same and share a node. Material data lives in a separate flat array, indexed by a running count the ray maintains during traversal. This is the Dolonius method: each descent step adds the `voxel_count` of skipped sibling subtrees to a running offset, so when a leaf is hit, that offset points directly into the flat material array.
 
-Sampling textures to build the palette is fast (a few thousand pixels per texture is plenty) and means voxelization runs in a single pass -- every sampled surface point gets a palette index immediately, no second pass needed.
+Uniform subtrees (LEAF_FLAG set) don't contribute to the material array and don't advance the running count. Their material either sits inline in the child entry or is handled by the level above.
 
-### Chunked parallel voxelization
+This layer type is right for scenes with lots of geometric repetition and varied materials. The DAG stays tight in cache because it carries no material payload.
 
-The scene bounding box is divided into 256^3 voxel chunks. Each chunk is processed by a thread pool worker that takes all triangles intersecting that chunk and voxelizes them. Triangles are clipped to the chunk boundary before voxelization so nothing is processed twice and no holes appear at edges.
+### Standard DAG
 
-Each worker outputs a sorted-by-Morton-code list of `(position, voxel)` pairs. Only surface voxels are emitted -- interior voxels that are completely surrounded by opaque neighbors on all six faces are culled at this stage.
+A standard DAG level deduplicates on geometry and material together. Two nodes only share a node if both their occupancy and their leaf data match exactly. Material data is inline in the leaf entries, not in a separate flat array.
 
-In practice, occupancy in any given chunk is low (1-3% for typical glTF scenes), so each chunk's voxel list is a few MB at most even though the worst-case bound is 67MB (256^3 * 4 bytes).
+This is right for the bottom levels of scenes where material variation is low and you want the DAG to capture both geometric and material repetition. A Minecraft chunk is a good example since most blocks are a single material with low variation.
 
-### Streaming sort and DAG construction
+### RAW
 
-Once all chunks are voxelized, a k-way merge of the sorted chunk outputs produces a globally sorted voxel stream in Morton order. This merge is streaming -- only one chunk's data is in memory per thread at a time.
-
-The DAG builder consumes this sorted stream bottom-up. Consecutive voxels that share a parent node in the 64-tree form a group; the builder processes each group, hashes the resulting node, deduplicates it, and moves up a level. Identical geometric subtrees naturally share nodes regardless of their materials.
-
-DAG deduplication is global and happens in memory. The geometry DAG is small enough that this is fine. The material array is built in parallel and streamed directly to a temp file, since it can be large and doesn't need to be in memory all at once. At the end, the packer writes the .lattice file: geometry sections first, then the material section appended from the temp file, then the header is finalized with the correct section offsets.
+A RAW level is just a flat 3D grid of u32 child entries. No tree structure, no deduplication. Each entry either points to a sub-DAG in the level below or is empty. RAW is right for the top of the hierarchy where deduplication almost never fires, and it avoids tree traversal overhead in regions that are nearly all unique.
 
 ---
 
-## The DAG
+## SoA layout
 
-The DAG is geometry-only. It stores solid/empty occupancy, nothing else. Because material data is absent, any two subtrees with the same geometric shape but different materials deduplicate to the same node. A wall with one texture and the same wall with a different texture share a node in the DAG.
+Every level stores its fields in Structure of Arrays layout. All fields are stored in separate contiguous arrays, each indexed by node index.
 
-This maximizes the dedup ratio. For a scene like the Bistro, many surfaces are geometrically repetitive even when their materials vary. The geometry DAG also stays tight in cache during traversal since its nodes carry no material payload.
+- `occupancy: [u64]` -- one bit per child slot. A 1 bit means a child exists there.
+- `voxel_count: [u32]` -- total Dolonius MAT entries contributed by this subtree. Only present on Geometry DAG levels. Uniform subtrees contribute 0.
+- `children_start: [u32]` -- where this node's children begin in the flat children array.
+- `children: [u32]` -- packed child entries for all nodes at this level, laid out contiguously.
 
-The tradeoff is that material lookup requires computing a running index. During traversal, each ray accumulates a count of voxels in preceding sibling subtrees. When it hits a leaf, that count is the offset into the flat material array. This is the Dolonius (2017) method. The overhead is one addition per traversal step.
+Only occupied children are stored. `occupancy[i].count_ones()` gives the child count for node `i`.
 
----
-
-## How the 64-tree is structured
-
-Each level stores its nodes in SoA layout. All fields are indexed by node index.
-
-- `occupancy: Vec<u64>` -- one bit per child slot. A 1 bit means a child exists there.
-- `voxel_count: Vec<u32>` -- total number of leaf voxels in this subtree. Used by Dolonius traversal to compute the material array index.
-- `children_start: Vec<u32>` -- where this node's children begin in the flat children array.
-- `children: Vec<u32>` -- packed child entries for all nodes in this level.
-
-Only occupied children are stored. `occupancy[i].count_ones()` gives the child count.
-
-The SoA layout matters for GPU traversal. A warp of 32 threads reading occupancy for 32 different nodes touches one contiguous memory region. AoS would scatter those reads.
-
-Each child entry is a raw u32. Bit 31 (LEAF_FLAG) distinguishes two cases:
-
-- LEAF_FLAG set: the lower bits are a material LUT index. Every voxel in that subtree has the same material. A completely uniform region collapses to one entry at any level.
-- LEAF_FLAG clear: the lower bits are a node index into the next level's pool.
+SoA layout matters for GPU traversal. A warp of 32 threads reading `occupancy` for 32 different nodes touches one contiguous memory region. AoS would scatter those reads across memory, causing cache misses for every field access.
 
 ---
 
-## Material data: the Dolonius method
+## LUT compression
 
-The flat material array stores LUT indices in the same order as a depth-first traversal of the geometry DAG would visit leaves. Each node stores `voxel_count`, the total number of leaf voxels in its subtree.
+LUT compression reduces the bit width of child entries at the bottom layer of any level by replacing full u32 values with short indices into a lookup table of unique values. It applies per tree root, not per level globally. So if a level contains 64 independent trees, each tree gets its own LUT.
 
-During traversal, when the ray descends into a child, it adds up the `voxel_count` of every preceding sibling. That running sum is the material base index for the subtree the ray is entering. When the ray hits a leaf, `material_base + leaf_position` gives the exact offset into the flat material array.
+### Why per tree root
 
-This never reads material data during the traversal phase, only at hit time. The geometry traversal stays tight in cache.
+The LUT belongs to a tree, not to a level. This matters because of how DAG deduplication interacts with LUT compression. In the Minecraft example, even though the world contains millions of block instances, the block pool only contains a few thousand unique blocks after dedup. Each unique block has exactly one LUT, shared by all instances of that block everywhere in the world via the DAG node sharing. LUT memory scales with unique content, not scene size.
 
-Dolonius adds about 1% overhead to the DAG compared to pure geometry-only. Per-pointer approaches (Dado et al. 2016) add about 2x. For path tracing where traversal dominates, the 1% overhead is well worth the cache benefit.
+### Construction algorithm
+
+LUT compression is built during tree construction, not as a separate post-process pass. As child entries are added to a tree, a hashmap tracks every unique u32 value seen. When a new unique value is encountered, it gets appended to the LUT. The child entry stored in the tree is always a u32 index into the LUT rather than the raw value directly.
+
+At this stage, all indices are full u32 values. The LUT is just a flat array of unique u32s.
+
+Once the tree is fully constructed, the LUT length is known. The minimum power-of-two bit width needed to address all entries is computed (1, 2, 4, 8, or 16 bits). All the u32 indices in the tree's child entries are then repacked into a custom bitpacked array at that width. Powers of two are required so the GPU can extract an index with a single bit shift and mask.
+
+Because the bit width changes during repacking, a custom bitpacked array type handles the storage. It supports converting its internal width after the fact, which is the operation that makes repacking straightforward.
+
+### LUT size and bit widths
+
+```
+LUT entry count    ->    index bit width
+1                         1 bit
+2 - 3                     2 bits
+4 - 15                    4 bits
+16 - 255                  8 bits
+256 - 65535               16 bits
+65536+                    no compression (store raw u32)
+```
+
+The bit width for each tree's LUT is stored in the section data alongside the LUT itself. The GPU reads it once per tree root and uses it for all child entry lookups within that tree.
+
+### What gets compressed
+
+LUT compression applies to the bottom layer of the level it's configured on. Upper layers within the same level still use raw u32 node indices, since those are structural pointers and their range is determined by the node pool size, not the number of unique values. Only the leaf values at the bottom of the tree benefit from LUT compression, since that's where the value space is small and enumerable.
 
 ---
 
-## Voxel format
+## Voxel payloads
 
-The material LUT is a flat array of deduplicated `Voxel` entries. Multiple positions in the flat material array can point to the same LUT entry, but `Voxel` values are stored once. The LUT is small enough to stay warm in cache.
+The voxel payload format varies by scene and is fully described in the `.lattice` header. The header stores the bit layout so the GPU knows how to decode a leaf value: where the color index is, where roughness is, where the flag bits are, and how wide the total payload is. The shader reads this once as uniforms and uses them for every hit. No separate shader variant is needed per scene.
 
-```
-Voxel (4 bytes, packed u32):
-
-  bits 31-15  normal      17-bit John White signed octahedral encoding
-  bit  14     transparent refracts rather than reflects
-  bit  13     metallic    conductor, albedo tints specular
-  bit  12     emissive    emits light at its albedo color
-  bits 11-8   roughness   0 = perfect mirror, 15 = fully diffuse
-  bits  7-0   palette     index into the scene's 256-entry color palette
-```
-
-**Normal encoding.** Normals use John White's signed octahedral encoding. Project the normal onto the L1 unit octahedron, rotate 45 degrees to redistribute quantization error uniformly, then store X and Y as u8 each plus a sign bit for Z. Average error is about 0.3 degrees. Decoding is one normalize in the shader.
-
-**Color palette.** 256 linear RGB entries, 768 bytes. Built at import time by sampling glTF textures and running k-means++ in OKLab space. Every voxel stores an 8-bit index into it.
-
-The number of unique voxel types determines `mat_index_bits`, the bit width needed to index the LUT:
+For a scene like the Bistro, the payload is 16 bits:
 
 ```
-log2(lut_entry_count) -> round up to next power of two
+Voxel (16 bits):
 
-examples:
-  2 unique voxels     -> 1 bit
-  200 unique voxels   -> 8 bits
-  50000 unique voxels -> 16 bits
+  bit  15     reserved
+  bit  14     transparent  refracts rather than reflects
+  bit  13     metallic     conductor, albedo tints specular
+  bit  12     emissive     emits light at its albedo color
+  bits 11-8   roughness    nibble, 0 = mirror, 15 = fully diffuse
+  bits  7-0   palette      index into the global 256-entry color palette
 ```
 
-`mat_index_bits` is stored in the .lattice header. The GPU reads it once as a uniform and extracts the index with `child & ((1 << mat_index_bits) - 1)`.
+For a scene like a Minecraft world where you want a full 24-bit color, the payload is 32 bits with a different layout. The traversal code doesn't care. It just reads the layout from the header uniforms and extracts fields with bit shifts.
+
+Because payload size varies per scene, the material array entry size varies too. Bistro uses 16-bit entries, Minecraft uses 32-bit. The header stores this so the loader reads the MAT section correctly.
+
+---
+
+## The global color palette
+
+The color palette for model imports is a fixed global 256-entry table, precomputed once as a perceptually uniform spread across OKLab space. It doesn't change between scenes. OKLab is perceptually uniform, so a uniform spread minimizes worst-case visible error for any input color. The palette is 768 bytes and stays in L1 cache permanently once uploaded.
+
+At import time, each sampled surface point maps to its nearest palette entry. Scenes that use the 8-bit palette color field in their voxel payload get this automatically.
+
+---
+
+## Example configurations
+
+### Bistro
+
+The Bistro is a dense architectural scene with lots of geometric repetition but varied materials. Colors are snapped to the global 256-entry color palette at import. There are potentially thousands of unique voxel payloads globally (up to 2^15 in theory given 256 colors and the material flag bits), but any individual tree usually has far fewer. Per-tree LUT compression often brings most trees down to 8-bit or fewer indices.
+
+A typical configuration:
+
+- Top level: RAW flat grid acting as a spatial index into the DAG trees below. No LUT compression since large regions are mostly unique.
+- Middle levels: Geometry DAG. Each tree root gets its own LUT. After construction, the LUT is checked and indices are repacked to the minimum bit width. Most trees compress to 8 bits or fewer.
+- Material data: flat MAT array of 16-bit voxel payloads in Dolonius DFS order.
+
+### Minecraft world
+
+A Minecraft world has a two-tier structure. Each block is a small voxel DAG. The world is a large DAG of blocks.
+
+A typical configuration:
+
+- Top level: RAW flat grid of 64^3 chunk pointers. 64^3 regions of a Minecraft world are almost never identical so dedup doesn't help here.
+- Middle levels: Geometry DAG with LUT compression. Deduplicates block geometry across the world. Most 64^3 regions only use around 100 unique block configurations so LUT indices compress to 8 bits. Because the block DAGs are deduplicated, the number of LUTs equals the number of unique blocks, not the number of block instances. A sandstone block appearing a million times has one LUT shared by all million instances.
+- Bottom levels: Standard DAG with LUT compression. Deduplicates voxel geometry and material together within each block. Individual block trees usually have very few unique voxel types so LUT indices often compress to 4 bits.
+
+The raw voxel count for a full Minecraft world is astronomical, but after two levels of dedup the actual node count sits in the millions. The whole thing fits in a few GB. u32 indices are fine throughout since dedup means you're counting unique subtrees, not individual voxels.
 
 ---
 
@@ -136,27 +167,29 @@ examples:
 
 ### Finding the hit
 
-The ray traverses the 64-tree using DDA stepping. At each node, the occupancy mask tells the shader which children exist. Empty children are skipped immediately. Occupied children either descend (LEAF_FLAG clear) or resolve (LEAF_FLAG set). An ancestor stack caches parent node indices so the ray doesn't re-descend from root on every step.
+The ray traverses the tree level by level. At each node, the occupancy mask tells the shader which children exist. Empty children are skipped immediately. The layer type of the current level tells the shader how to handle a leaf: Geometry DAG levels do a Dolonius material lookup at hit time, Standard DAG levels read the payload inline from the child entry, RAW levels follow the pointer to the next level.
 
-While descending, the ray accumulates the material base index by summing `voxel_count` for preceding siblings. This is maintained on the ancestor stack alongside the node index, so the cost is one addition per descent step.
+If a level has LUT compression, the child entry is first decoded through that tree's LUT before being used. The LUT is small and cache-resident so this adds no meaningful cost.
 
-When LEAF_FLAG is hit, `materials[material_base + leaf_position]` gives the LUT index, and `lut[lut_index]` gives the Voxel.
+An ancestor stack caches parent node indices so the ray doesn't re-descend from root on every step. For Geometry DAG levels, the stack also carries the running Dolonius material base offset, updated by one addition per descent step.
+
+When a leaf is hit, the face normal comes from whichever face the DDA ray exited. Nothing about the normal is stored in the voxel payload.
 
 ### Traversal optimizations
 
-**Fractional coordinate encoding.** The tree lives in [1.0, 2.0). IEEE floats in that range have exponent zero, so the mantissa encodes position directly as fixed-point. Extracting the cell index at any level is `(bits(pos) >> scale_exp) & 3` -- two bit operations, no multiply or divide. Descending decrements `scale_exp` by 2.
+**Fractional coordinate encoding.** The tree lives in [1.0, 2.0). IEEE floats in that range have exponent zero, so the mantissa encodes position as fixed-point. Extracting the cell index at any level is two bit operations with no multiply or divide. Descending decrements `scale_exp` by 2.
 
-**Ancestor stack.** Caches parent node indices and material base offsets. When the ray steps to a neighbor, comparing old and new position bits identifies the highest level that changed. The stack has the right values ready. About 2x speedup over root-to-leaf descent.
+**Ancestor stack.** Caches parent node indices and Dolonius base offsets. When the ray steps to a neighbor, comparing old and new position bits identifies the highest level that changed. The stack has the right values ready. About 2x speedup over root-to-leaf descent.
 
-**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit occupancy mask. If so, the step size doubles. The check is one mask and compare on the existing field. Adds about 21% more iterations for free.
+**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit occupancy mask. If so, the step size doubles. One mask and compare on an existing field. Adds about 21% more empty space skipped for free.
 
-**Ray-octant mirroring.** The coordinate system is mirrored to the negative ray octant at traversal start. With all direction components negative, finding the exit face simplifies to finding the minimum of three distances with no sign conditionals. About 10% faster.
+**Ray-octant mirroring.** The coordinate system is mirrored to the negative ray octant at traversal start. With all direction components negative, finding the exit face is just finding the minimum of three distances with no sign conditionals. About 10% faster.
 
 ---
 
 ## Lighting
 
-Lighting is full path tracing. Primary rays are dispatched from the camera. On each hit, the shader reads the Voxel, samples the BRDF (diffuse or specular depending on roughness/metallic flags), and dispatches a secondary ray. Emissive voxels contribute light directly. Shadow rays are not a separate pass -- they emerge naturally from the path tracing loop.
+Lighting is full path tracing. Primary rays dispatch from the camera. On each hit, the shader reads the voxel payload, derives the face normal from the DDA exit face, samples the BRDF based on roughness and the metallic flag, and dispatches a secondary ray. Emissive voxels contribute light directly. Shadow rays aren't a separate pass, they come out of the path tracing loop naturally.
 
 Each voxel face stores a running weighted average of accumulated indirect light:
 
@@ -164,19 +197,19 @@ Each voxel face stores a running weighted average of accumulated indirect light:
 L_new = (1 - alpha) * L_old + alpha * S
 ```
 
-`S` is the new path traced sample. `alpha` is tuned per surface type: small for diffuse (stable accumulation over many frames) and larger for specular (faster response to view changes). No sample history buffers, no reservoirs -- one color value per face.
+`S` is the new path traced sample. `alpha` is tuned per surface type: small for diffuse (stable accumulation over many frames) and larger for specular (faster response to view changes). No sample history buffers, no reservoirs. One color value per face.
 
-Transparent voxels refract the ray using the surface normal. Metallic voxels tint the specular lobe by albedo. Emissive voxels inject radiance into the path without consuming a bounce.
+Transparent voxels refract the ray using the face normal. Metallic voxels tint the specular lobe by albedo. Emissive voxels inject radiance into the path without consuming a bounce.
 
 ---
 
 ## Disk format: PSVDAG
 
-On disk, sub-node references are removed from the children arrays. Nodes are written depth-first. The first time a unique node appears it gets a label. Every subsequent reference to the same node is a caller, a back-reference to that label. LEAF_FLAG entries are written as-is since they're terminal values.
+On disk, sub-node references are removed from the children arrays. Nodes are written depth-first. The first time a unique node appears it gets a label. Every subsequent reference to the same node is a back-reference to that label. LEAF_FLAG entries are written as-is since they're terminal values.
 
 The loader reconstructs explicit sub-node indices by walking the DFS stream. Loading is close to a direct copy.
 
-PSVDAG achieves 2.8-3.8x smaller files than pointer-based SVDAG. For a scene with many repeated geometric structures, the sharing factor is large and PSVDAG captures most of it. Every repeated node appears once in the DFS stream and is referenced cheaply everywhere else.
+PSVDAG achieves 2.8-3.8x smaller files than pointer-based SVDAG. Every repeated node appears once in the DFS stream and is referenced cheaply everywhere else.
 
 ---
 
@@ -184,40 +217,57 @@ PSVDAG achieves 2.8-3.8x smaller files than pointer-based SVDAG. For a scene wit
 
 ```
 Header:
-  magic:           [u8; 4]    "LTCE"
-  version:         u16
-  flags:           u16
-  num_levels:      u8
-  mat_index_bits:  u8         1, 2, 4, 8, 16, or 32
-  world_min:       [i64; 3]   voxel-space coordinates
-  world_max:       [i64; 3]
-  section_count:   u32
-  sections:        [{tag: u32, offset: u64, size: u64}; section_count]
-```
+  magic:          [u8; 4]     "LTCE"
+  version:        u16
+  flags:          u16
+  world_min:      [i64; 3]    voxel-space coordinates
+  world_max:      [i64; 3]
+  num_levels:     u8
+  payload_bits:   u8          total bit width of a voxel payload (16 or 32)
+  payload_layout: u32         packed description of payload field offsets and widths
+  mat_entry_size: u8          bytes per MAT array entry (2 or 4)
+  _pad:           [u8; 3]
+  levels:         [LevelDesc; num_levels]
+  section_count:  u32
+  sections:       [{tag: u32, offset: u64, size: u64}; section_count]
 
-Sections are seekable independently via the offset table. Geometry sections are written first (they're small and needed to set up the traversal), then the material array (which is large and streamed in from a temp file during build).
+LevelDesc:
+  layer_type:     u8          0 = RAW, 1 = Geometry DAG, 2 = Standard DAG
+  lut_enabled:    u8          0 = no LUT compression on this level, 1 = enabled
+  _pad:           [u8; 2]
+```
 
 Section tags:
 
 ```
 0x4C564C**  LVL*    one section per tree level (* = level index, 0 = root)
-  node_count:   u32
-  occupancy:    [u64; node_count]
-  voxel_count:  [u32; node_count]
-  children:     [u32; sum of popcount(occupancy[i]) for all nodes]
-                encoded in DFS order (PSVDAG: node refs replaced by caller labels)
+  node_count:       u32
+  occupancy:        [u64; node_count]       SoA field
+  voxel_count:      [u32; node_count]       SoA field, Geometry DAG levels only
+  children_start:   [u32; node_count]       SoA field
+  children:         [u32; total_children]   bitpacked if LUT enabled for this level
+                    encoded in PSVDAG DFS order
 
-0x4C555400  LUT     material LUT (deduplicated Voxel entries)
-  entry_count:  u32
-  entries:      [Voxel; entry_count]   4 bytes each
+  if lut_enabled:
+    tree_count:     u32
+    trees:          [TreeLutDesc; tree_count]
 
-0x4D415400  MAT     flat material array (Dolonius DFS order)
-  entry_count:  u32
-  entries:      [u32; entry_count]   LUT indices
+TreeLutDesc:
+  root_node_index:  u32
+  lut_bits:         u8        actual index bit width used (1/2/4/8/16)
+  _pad:             [u8; 3]
+  lut_entry_count:  u32
+  lut_entries:      [u32; lut_entry_count]   full u32 values before compression
+  children_offset:  u64       byte offset into this level's children array
+                              where this tree's bitpacked indices begin
 
-0x50414C00  PAL     color palette
+0x4D415400  MAT     flat material array (Dolonius DFS order, Geometry DAG levels only)
   entry_count:  u32
-  entries:      [[u8; 3]; entry_count]   linear RGB
+  entries:      [u16 or u32; entry_count]   size set by mat_entry_size in header
+
+0x50414C00  PAL     global color palette
+  entry_count:  u32                         always 256
+  entries:      [[u8; 3]; 256]              linear RGB, perceptually uniform OKLab spread
 
 0x53504958  SPIX    spatial index
   entry_count:  u32
@@ -234,29 +284,31 @@ lattice/
 
   src/
     dag/
-      mod.rs          # Dag, Level (SoA), MaterialLut
+      mod.rs          # Dag, Level (SoA), layer type definitions
       node.rs         # LEAF_FLAG and child entry helpers
-      voxel.rs        # Voxel struct and ColorPalette
+      voxel.rs        # voxel payload description, ColorPalette
+      bitpacked.rs    # custom bitpacked array type, width conversion
 
     import/
       mod.rs          # importer entry point, VoxelChunk output type
-      palette.rs      # k-means++ in OKLab space, texture sampling
+      palette.rs      # global color palette, nearest-entry lookup
       gltf/
         mod.rs        # glTF scene loading, chunk dispatch
         mesh.rs       # mesh data extraction, triangle clipping to chunks
-        material.rs   # PBR material -> Voxel mapping
-        voxelizer.rs  # SAT intersection test, texture sampling, normal baking
+        material.rs   # PBR material -> voxel payload mapping
+        voxelizer.rs  # SAT intersection test, texture sampling
 
     pack/
       mod.rs          # packing entry point
       sort.rs         # k-way merge of sorted chunk streams (Morton order)
-      dag.rs          # bottom-up streaming DAG construction
+      dag.rs          # bottom-up streaming DAG construction, layer type dispatch
+      lut.rs          # per-tree LUT construction, hashmap dedup, bitwidth selection, repacking
       materials.rs    # Dolonius material array, streamed to temp file
       serialize.rs    # .lattice file writing, PSVDAG encoding
 
     load/
       mod.rs          # loader entry point
-      header.rs       # .lattice header parsing, section index
+      header.rs       # .lattice header parsing, level descriptors, section index
       stream.rs       # PSVDAG DFS stream decoding, node index reconstruction
       upload.rs       # CPU -> GPU buffer upload
 
@@ -264,20 +316,20 @@ lattice/
       mod.rs          # renderer entry point
       tracer.rs       # render loop, pass orchestration
       camera.rs       # camera state, ray generation
-      traverse.rs     # 64-tree traversal, Dolonius material lookup
+      traverse.rs     # 64-tree DDA, layer type dispatch, LUT decode, Dolonius lookup, face normals
       gi.rs           # path tracing, per-face accumulation
       debug.rs        # debug overlay passes
 
   shaders/
-    common.wgsl       # shared math, type definitions
-    traverse.wgsl     # 64-tree DDA, Dolonius material index accumulation
+    common.wgsl       # shared math, type definitions, payload decode helpers
+    traverse.wgsl     # 64-tree DDA, per-tree LUT decode, Dolonius index accumulation
     primary.wgsl      # primary ray dispatch
     gi.wgsl           # path tracing bounce loop
     accumulate.wgsl   # per-face weighted GI accumulation
     debug.wgsl        # debug overlays
 
   tools/
-    pack.rs           # CLI: glTF scene -> .lattice
+    pack.rs           # CLI: scene -> .lattice
     render.rs         # CLI: .lattice -> frames
     inspect.rs        # CLI: print .lattice header and stats
 ```
@@ -287,10 +339,14 @@ lattice/
 ## Key findings from research
 
 - A 64-tree produces 37% fewer total nodes than an octree on the same scene and traverses faster, especially with the 64-bit occupancy mask enabling sub-block coalescing.
-- Geometry-only DAG deduplication with the Dolonius attribute method adds about 1% to DAG size compared to a pure geometry DAG. Per-pointer attribute methods (Dado et al.) add about 2x. For path tracing where traversal dominates, the Dolonius approach is the right call.
+- Geometry-only DAG deduplication with the Dolonius attribute method adds about 1% to DAG size compared to a pure geometry DAG. Per-pointer attribute methods (Dado et al.) add about 2x. For path tracing where traversal dominates, Dolonius is the right call.
 - Leaf-level deduplication is where almost all savings happen. At the 4^3 level, 77% of nodes are duplicates. At the 64^3 level, 0.1%.
 - The ancestor stack is the highest-impact traversal optimization (~2x). Sub-block coalescing adds ~21%, ray-octant mirroring adds ~10%.
 - PSVDAG-style encoding achieves 2.8-3.8x smaller files than pointer-based SVDAG.
+- SVO and DAG use the same traversal algorithm. The DAG's advantage is purely cache efficiency from having fewer unique nodes in memory.
+- LUT compression scales with unique content, not scene size. In a Minecraft world, the number of LUTs equals the number of unique block types after dedup, not the number of block instances. A block appearing a million times has one LUT.
+- Chaining small LUT lookups at hit time is basically free if the tables stay cache-resident. A 256-entry LUT is 1KB and fits in L1 easily.
+- With u32 indices and strong DAG dedup, even a Minecraft-scale world stays within u32 range. The index limit applies to unique nodes, not raw voxels.
 
 ---
 
@@ -311,6 +367,7 @@ lattice/
 
 | Project | Description |
 |---------|-------------|
+| [Voxel Raymarching](github.com/jamescatania1/voxel-raymarching) | Voxel raymarching with Rust and WGPU |
 | [VoxelRT](https://github.com/dubiousconst282/VoxelRT) | Voxel rendering experiments: brickmap, Tree64, XBrickMap, MultiDDA benchmarks |
 | [HashDAG](https://github.com/Phyronnaz/HashDAG) | Official open-source implementation of the HashDAG paper (Careil et al. 2020) |
 | [Voxelis](https://github.com/WildPixelGames/voxelis) | Pure Rust SVO-DAG crate with batching, reference counting, Bevy/Godot bindings |
@@ -358,6 +415,7 @@ lattice/
 
 | Paper | Link |
 |-------|------|
+| Hybrid Voxel Formats for Efficient Ray Tracing | [ARXIV](https://arxiv.org/html/2410.14128v1) |
 | High Resolution Sparse Voxel DAGs, Kampe, Sintorn, Assarsson 2013 | [PDF](https://icg.gwu.edu/sites/g/files/zaxdzs6126/files/downloads/highResolutionSparseVoxelDAGs.pdf) |
 | SSVDAGs: Symmetry-aware Sparse Voxel DAGs, Villanueva, Marton, Gobbetti 2016 | [ACM](https://dl.acm.org/doi/10.1145/2856400.2856406) |
 | Interactively Modifying Compressed Sparse Voxel Representations (HashDAG), Careil, Billeter, Eisemann 2020 | [Wiley](https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.13916) |
@@ -375,7 +433,7 @@ lattice/
 | Geometry and Attribute Compression for Voxel Scenes (Dado), Dado et al. 2016 | [CGF](https://diglib.eg.org/handle/10.1111/cgf.12841) |
 | Compressing Color Data for Voxelized Surface Geometry (Dolonius), Dolonius et al. 2017 | [ACM I3D](https://dl.acm.org/doi/10.1145/3023368.3023381) |
 
-#### Surveys
+#### Surveys and Hybrid Formats
 
 | Paper | Link |
 |-------|------|

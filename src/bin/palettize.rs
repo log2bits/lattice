@@ -67,7 +67,7 @@ fn main() {
       [pr, pg, pb, a]
     })
     .collect();
-
+  
   let mut output = image::RgbaImage::new(w, h);
   for (i, &[r, g, b, a]) in output_pixels.iter().enumerate() {
     let x = (i as u32) % w;
