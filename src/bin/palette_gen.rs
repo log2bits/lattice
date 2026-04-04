@@ -661,9 +661,9 @@ fn som_layout(labs: &[[f32; 3]]) -> Vec<usize> {
   let mut weights: Vec<[f32; 3]> = labs.to_vec();
   weights.shuffle(&mut rng);
 
-  let num_iters = 2_000_000usize;
+  let num_iters = 20000usize;
   let sigma_init = side as f32 / 2.0;
-  let sigma_final = 0.5f32;
+  let sigma_final = 0.1f32;
   let lr_init = 1.0f32;
   let lr_final = 0.001f32;
 
