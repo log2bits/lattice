@@ -362,20 +362,20 @@ lattice/
       upload.rs       # CPU -> GPU buffer upload
 
     render/
-      mod.rs          # renderer entry point
-      tracer.rs       # render loop, pass orchestration
-      camera.rs       # camera state, ray generation
-      traverse.rs     # 64-tree DDA, layer type dispatch, LUT decode, Dolonius lookup, face normals
-      gi.rs           # path tracing, per-face accumulation
-      debug.rs        # debug overlay passes
+      mod.rs          # renderer entry point, pipeline setup
+      tracer.rs       # frame loop, compute pass dispatch, output presentation
+      camera.rs       # camera state, uniform buffer layout
+      traverse.rs     # traversal pipeline and bind group setup
+      gi.rs           # GI pipeline, per-face lighting buffer management
+      debug.rs        # debug overlay pipeline and mode uniforms
 
-  shaders/
-    common.wgsl       # shared math, type definitions, payload decode helpers
-    traverse.wgsl     # 64-tree DDA, per-tree LUT decode, Dolonius index accumulation
-    primary.wgsl      # primary ray dispatch
-    gi.wgsl           # path tracing bounce loop
-    accumulate.wgsl   # per-face weighted GI accumulation
-    debug.wgsl        # debug overlays
+  shaders/            # all rendering logic lives here -- Rust side is orchestration only
+    common.wgsl       # shared math, type definitions, bitpacked decode helpers
+    traverse.wgsl     # 64-tree DDA, intra-section/LUT child decode, Dolonius offset accumulation
+    primary.wgsl      # primary ray dispatch, one thread per pixel
+    gi.wgsl           # path tracing bounce loop, BRDF sampling, emissive injection
+    accumulate.wgsl   # per-face weighted GI accumulation into the lighting buffer
+    debug.wgsl        # debug overlays: normals, depth, voxel index, occupancy
 
   tools/
     pack.rs           # CLI: scene -> .lattice

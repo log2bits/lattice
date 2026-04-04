@@ -1,14 +1,25 @@
 #![allow(unused)]
-use crate::load::upload::GpuLattice;
-use super::camera::Camera;
 
-// Top-level renderer. Owns the wgpu pipelines and per-frame state.
+// Frame loop and pass orchestration. No rendering logic lives here.
+// Each frame: dispatch primary rays, dispatch GI bounces, dispatch
+// accumulation, present output. All computation is in the WGSL shaders.
+
+use crate::load::upload::GpuLattice;
+use super::camera::{Camera, CameraUniforms};
+use super::traverse::TraversalPass;
+use super::gi::GiPass;
+use super::debug::DebugOverlay;
+
 pub struct Renderer {
-  device:   wgpu::Device,
-  queue:    wgpu::Queue,
-  lattice:  GpuLattice,
-  camera:   Camera,
-  output:   wgpu::Texture,
+  device:    wgpu::Device,
+  queue:     wgpu::Queue,
+  camera:    Camera,
+  traversal: TraversalPass,
+  gi:        GiPass,
+  debug:     DebugOverlay,
+  output:    wgpu::Texture,
+  width:     u32,
+  height:    u32,
 }
 
 impl Renderer {
@@ -16,12 +27,11 @@ impl Renderer {
     todo!()
   }
 
-  // Dispatches one frame: primary rays, GI bounce loop, accumulation.
+  // Dispatches one frame: traversal -> GI -> accumulation -> (debug overlay).
   pub fn render(&mut self) {
     todo!()
   }
 
-  // Returns the current output texture view for presentation.
   pub fn output_view(&self) -> wgpu::TextureView {
     todo!()
   }

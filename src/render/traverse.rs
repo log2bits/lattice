@@ -1,20 +1,41 @@
 #![allow(unused)]
 
-// CPU-side reference implementation of the 64-tree DDA traversal.
-// The actual render path runs in traverse.wgsl; this is for testing and debugging.
+// Traversal pass orchestration. The actual 64-tree DDA, LUT decoding, and
+// Dolonius offset accumulation all live in traverse.wgsl. This file manages
+// the pipeline, bind groups, and the hit buffer the traversal writes into.
 
-pub struct HitResult {
-  pub t:          f32,       // ray parameter at hit
-  pub position:   [f32; 3],
-  pub face_normal:[f32; 3],  // derived from DDA exit face, not stored per-voxel
-  pub voxel:      u32,       // decoded 32-bit voxel value from global voxel LUT
+use crate::load::upload::GpuLattice;
+
+// Buffer written by the traversal pass. One entry per pixel: the hit voxel
+// index, face, and ray parameter t. Read by the GI pass on the same frame.
+pub struct HitBuffer {
+  pub buf:          wgpu::Buffer,
+  pub pixel_count:  u64,
 }
 
-// Traces a ray through the lattice and returns the first hit, if any.
-pub fn trace_ray(
-  origin:    [f32; 3],
-  direction: [f32; 3],
-  // lattice data would be passed here once types are finalized
-) -> Option<HitResult> {
-  todo!()
+impl HitBuffer {
+  pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    todo!()
+  }
+
+  pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    todo!()
+  }
+}
+
+// Pipeline and bind group for the traversal compute pass.
+pub struct TraversalPass {
+  pub pipeline:   wgpu::ComputePipeline,
+  pub bind_group: wgpu::BindGroup,
+  pub hit_buf:    HitBuffer,
+}
+
+impl TraversalPass {
+  pub fn new(device: &wgpu::Device, lattice: &GpuLattice, width: u32, height: u32) -> Self {
+    todo!()
+  }
+
+  pub fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
+    todo!()
+  }
 }

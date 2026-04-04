@@ -1,22 +1,39 @@
 #![allow(unused)]
 
-// Per-face GI accumulation state and update logic.
-// Each voxel face stores a running weighted average of accumulated indirect light:
-//   L_new = (1 - alpha) * L_old + alpha * S
-// where S is the new path traced sample and alpha is tuned per surface type.
+// GI pass orchestration. All path tracing and per-face accumulation logic
+// lives in gi.wgsl and accumulate.wgsl. This file manages the pipelines,
+// bind groups, and the per-face lighting buffer on the GPU.
 
-pub struct GiAccumulator {
-  // One [f32; 3] color value per face. Indexed by (node_idx * 6 + face_idx).
-  pub face_radiance: Vec<[f32; 3]>,
+use crate::load::upload::GpuLattice;
+
+// Per-face lighting buffer. Stores one accumulated radiance value per voxel
+// face. Indexed by (node_idx * 6 + face_idx). Lives entirely on the GPU;
+// the CPU never reads it back except for debug captures.
+pub struct LightingBuffer {
+  pub buf:        wgpu::Buffer,
+  pub face_count: u64,
 }
 
-impl GiAccumulator {
-  pub fn new(face_count: usize) -> Self {
+impl LightingBuffer {
+  pub fn new(device: &wgpu::Device, face_count: u64) -> Self {
+    todo!()
+  }
+}
+
+// Pipelines and bind groups for the GI and accumulation passes.
+pub struct GiPass {
+  pub gi_pipeline:          wgpu::ComputePipeline,
+  pub accumulate_pipeline:  wgpu::ComputePipeline,
+  pub bind_group:           wgpu::BindGroup,
+  pub lighting_buf:         LightingBuffer,
+}
+
+impl GiPass {
+  pub fn new(device: &wgpu::Device, lattice: &GpuLattice, face_count: u64) -> Self {
     todo!()
   }
 
-  // Blends a new sample into the running average for the given face.
-  pub fn accumulate(&mut self, face_idx: usize, sample: [f32; 3], alpha: f32) {
+  pub fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
     todo!()
   }
 }
