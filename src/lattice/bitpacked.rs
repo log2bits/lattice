@@ -1,4 +1,4 @@
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BitpackedArray {
 	pub data: Vec<u32>,
 	pub bits: u8,
@@ -40,10 +40,11 @@ impl BitpackedArray {
 			self.repack_in_place(((32 - value.leading_zeros()) as u8).next_power_of_two());
 		}
 		let bit_pos = self.len << self.bits.trailing_zeros();
-		if bit_pos & 31 == 0 {
+		let bit_offset = bit_pos & 31;
+		if bit_offset == 0 {
 			self.data.push(0);
 		}
-		self.data[(bit_pos >> 5) as usize] |= value << (bit_pos & 31);
+		self.data[(bit_pos >> 5) as usize] |= value << bit_offset;
 		self.len += 1;
 	}
 
@@ -61,7 +62,7 @@ impl BitpackedArray {
 		self.data[(bit_pos >> 5) as usize] =
 			(self.data[(bit_pos >> 5) as usize] & !mask) | (value << bit_off);
 	}
-	
+
 	pub fn repack_in_place(&mut self, new_bits: u8) {
 		assert!(matches!(new_bits, 1 | 2 | 4 | 8 | 16 | 32));
 		if new_bits == self.bits {

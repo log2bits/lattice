@@ -51,6 +51,18 @@ impl Voxel {
 	}
 }
 
+impl From<u32> for Voxel {
+	fn from(v: u32) -> Self {
+		Voxel(v)
+	}
+}
+
+impl From<Voxel> for u32 {
+	fn from(v: Voxel) -> Self {
+		v.0
+	}
+}
+
 // 256-entry perceptually uniform color palette in OKLab space, precomputed
 // once using sample elimination. Used at import time to quantize scene colors,
 // bounding the global voxel LUT to a manageable size.

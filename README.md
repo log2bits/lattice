@@ -20,8 +20,8 @@ Each stage is independent. The handoff between stages is a well-defined data str
 ## Design choices that are fixed
 
 - Each level of the tree is one of three layer types: Geometry DAG, Material DAG, or Grid. No other layer types.
-- Every level uses SoA layout. No AoS.
-- All voxel references resolve through the global voxel LUT to a fixed 32-bit format. Per-section-root LUTs and pool-size bitpacking compress the intermediate indices. The `Lut<T>` + `BitpackedArray` primitives are reused for all of these.
+- DAG levels use SoA layout. Grid levels are flat arrays. No AoS anywhere.
+- All voxel references resolve through the global voxel LUT to a fixed 32-bit format. Per-section-root LUTs and pool-size bitpacking compress the intermediate indices. The `Lut` and `BitpackedArray` primitives are reused for all of these. They are always kept separate and composed at the call site.
 - The renderer is always full path tracing. No rasterization fallback, no hybrid primary visibility.
 - All domain counts and indices are `u32`. `usize` is only used at `Vec` indexing call sites.
 - Face normals are derived from the DDA exit face at traversal time. No per-voxel normals are stored.
@@ -33,6 +33,8 @@ Each stage is independent. The handoff between stages is a well-defined data str
 ## The three layer types
 
 Every child entry everywhere in the tree is a u32. Bit 31 (LEAF_FLAG) is always the same: set means this is a leaf, clear means it's a pointer to the next level's node pool. What the remaining bits mean depends on the layer type, which the header tells you.
+
+Each layer type is a separate struct in its own file with exactly the fields it needs. `SectionData` is an enum with one variant per type. Adding a new layer type (e.g. SSVDAG) means adding a new file, a new struct, and a new enum variant. The compiler points out every match arm that needs updating.
 
 ### Geometry DAG
 
@@ -52,16 +54,20 @@ This is right for the bottom levels of scenes where material variation is low an
 
 A grid level is just a flat 3D array of u32 child entries. No tree structure, no deduplication. Each entry either points to a sub-DAG in the level below or is empty. Grid is right for the top of the hierarchy where deduplication almost never fires, and it avoids tree traversal overhead in regions that are nearly all unique.
 
+Grid sections are structurally separate from DAG sections in memory. A grid section's data is `SectionData::Grid(GridLevel)` where `GridLevel` holds `dims: [u32; 3]` and a flat `children: BitpackedArray`. The dims define the 3D extent of the flat array; the BitpackedArray stores one entry per cell, addressed by flat index.
+
 ---
 
 ## SoA layout
 
-Every level stores its fields in Structure of Arrays layout. All fields are stored in separate contiguous arrays, each indexed by node index.
+This applies to DAG levels (Geometry DAG and Material DAG). Grid levels are flat arrays and don't use this structure.
+
+Each DAG level stores its fields in Structure of Arrays layout. All fields are stored in separate contiguous arrays, each indexed by node index.
 
 - `occupancy: [u64]` -- one bit per child slot. A 1 bit means a child exists there.
 - `voxel_count: [u32]` -- total materials array entries contributed by this subtree. Only present on Geometry DAG levels. Uniform subtrees contribute 0.
 - `children_start: [u32]` -- where this node's children begin in the flat children array.
-- `children: [u32]` -- packed child entries for all nodes at this level, laid out contiguously.
+- `children: BitpackedArray` -- packed child entries for all nodes at this level, laid out contiguously. Stored at the minimum power-of-two bit width that covers the node pool size.
 
 Only occupied children are stored. `occupancy[i].count_ones()` gives the child count for node `i`.
 
@@ -124,7 +130,9 @@ The local table is owned by the section root node and shared by all instances th
 
 ### Materials array
 
-For Geometry DAG sections, the materials array stores one global voxel LUT index per non-uniform leaf in Dolonius DFS order. The entries are bitpacked at `voxel_bits`. A small local LUT of unique indices within the materials array can compress further if the section's voxel variety is low.
+For Geometry DAG sections, the materials array stores one global voxel LUT index per non-uniform leaf in Dolonius DFS order. The entries are bitpacked at `voxel_bits`.
+
+The materials array is per section root, stored on `SectionRoot` alongside the per-root voxel LUT. Each root's DFS contributes a contiguous slice. Because roots are deduplicated by the DAG, the number of distinct materials arrays equals the number of unique root nodes, not the number of times those roots appear in the scene. On disk, all per-root materials arrays for a section are concatenated into a single flat MATL chunk; each `SectionRootDesc` stores a `materials_start` entry index so the loader and GPU know where each root's slice begins.
 
 ### Bit widths
 
@@ -212,6 +220,8 @@ The ray traverses the tree level by level. At each node, the occupancy mask tell
 Intra-section child pointers are decoded with a single shift and mask using the level's fixed bit width. At section boundaries, leaf entries are decoded through the section root's LUT before being used. The LUT is small and cache-resident so this adds no meaningful cost.
 
 An ancestor stack caches parent node indices so the ray doesn't re-descend from root on every step. For Geometry DAG levels, the stack also carries the running Dolonius material base offset, updated by one addition per descent step.
+
+At section boundaries, each section root has a `leaf_start` field: the logical entry index into the bottom level's `children` BitpackedArray where that root's leaf entries begin. This is the in-memory representation. The on-disk `SectionRootDesc` stores `leaf_offset` instead, a byte offset into the same array, computed from `leaf_start` and the level's bit width at serialization time.
 
 When a leaf is hit, the face normal comes from whichever face the DDA ray exited. Nothing about the normal is stored in the voxel payload.
 
@@ -305,10 +315,16 @@ SectionRootDesc:
   lut_entries:      [u32; lut_entry_count]     global voxel LUT indices
   leaf_offset:      u64         byte offset into the bottom level's children array
                                 where this root's bitpacked leaf entries begin
+                                (in memory this is leaf_start: u32, a logical entry index;
+                                the byte offset is computed at serialization time)
+  materials_start:  u32         entry index into this section's MATL array where this
+                                root's Dolonius materials slice begins (Geometry DAG only,
+                                0 for other section types)
 
-MATL    one chunk per Geometry DAG section -- the Dolonius materials array
+MATL    one chunk per Geometry DAG section -- all per-root materials arrays concatenated
   entry_count:  u32
   entries:      [u8; ...]       global voxel LUT indices, bitpacked at voxel_bits
+                                (each root's slice starts at its materials_start)
 
 VOXL    global voxel LUT
   entry_count:  u32
@@ -333,11 +349,15 @@ lattice/
 
   src/
     lattice/
-      mod.rs          # Lattice, SectionConfig, LevelConfig, Level (SoA), layer type definitions
+      mod.rs          # Lattice, SectionConfig, SectionData enum, Section,
+                      #   LayerType, ChildIter
+      geometry_dag.rs # GeometryDagLevel (SoA), GeometryDagRoot (LUT + materials)
+      material_dag.rs # MaterialDagLevel (SoA), MaterialDagRoot (LUT, no materials)
+      grid.rs         # GridLevel (flat 3D array)
       node.rs         # LEAF_FLAG and child entry helpers
-      voxel.rs        # Voxel (32-bit format), ColorPalette
-      bitpacked.rs    # BitpackedArray -- fixed-width packed storage, width conversion
-      lut.rs          # Lut -- unique u32 value table, auto-updating bit width
+      voxel.rs        # Voxel (repr(transparent) u32 newtype), ColorPalette
+      bitpacked.rs    # BitpackedArray -- fixed-width packed storage, width conversion, Hash
+      lut.rs          # Lut -- unique u32 dedup table
 
     import/
       mod.rs          # importer entry point, VoxelChunk output type
