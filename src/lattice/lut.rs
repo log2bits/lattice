@@ -1,48 +1,48 @@
 use std::collections::HashMap;
-use std::hash::Hash;
-use super::bitpacked::BitpackedArray;
 
-// A set of unique values of type T, referenced by bitpacked indices.
-// Used for the global voxel LUT and per-section-root LUTs.
-//
-// During construction, call insert() to add values and get back local indices.
-// Call finalize() once all values are added: it computes the minimum bit width
-// and stores it in bits. The caller is responsible for repacking index storage.
-pub struct Lut<T: Hash + Eq + Clone> {
-  pub values: Vec<T>,
-  pub bits:   u8,
-  dedup:      HashMap<T, u32>,
+// A set of unique u32 values, referenced by index. Callers store indices in
+// a BitpackedArray, which auto-repacks as values are pushed into it.
+pub struct Lut {
+	pub values: Vec<u32>,
+	dedup: HashMap<u32, u32>,
 }
 
-impl<T: Hash + Eq + Clone> Lut<T> {
-  pub fn new() -> Self {
-    Self { values: Vec::new(), bits: 1, dedup: HashMap::new() }
-  }
+impl Lut {
+	pub fn new() -> Self {
+		Self {
+			values: Vec::new(),
+			dedup: HashMap::new(),
+		}
+	}
 
-  pub fn with_capacity(cap: usize) -> Self {
-    Self { values: Vec::with_capacity(cap), bits: 1, dedup: HashMap::with_capacity(cap) }
-  }
+	pub fn with_capacity(cap: u32) -> Self {
+		Self {
+			values: Vec::with_capacity(cap as usize),
+			dedup: HashMap::with_capacity(cap as usize),
+		}
+	}
 
-  // Returns the index of value in the table, inserting it if not present.
-  pub fn insert(&mut self, value: T) -> u32 {
-    todo!()
-  }
+	// Returns the index of value in the table, inserting it if not present.
+	pub fn insert(&mut self, value: u32) -> u32 {
+		if let Some(&idx) = self.dedup.get(&value) {
+			return idx;
+		}
+		let idx = self.values.len() as u32;
+		self.values.push(value);
+		self.dedup.insert(value, idx);
+		idx
+	}
 
-  // Returns the index of value if it is already in the table.
-  pub fn get(&self, value: &T) -> Option<u32> {
-    todo!()
-  }
+	// Returns the index of value if it is already in the table.
+	pub fn get(&self, value: u32) -> Option<u32> {
+		self.dedup.get(&value).copied()
+	}
 
-  pub fn len(&self) -> usize {
-    self.values.len()
-  }
+	pub fn len(&self) -> u32 {
+		self.values.len() as u32
+	}
 
-  pub fn is_empty(&self) -> bool {
-    self.values.is_empty()
-  }
-
-  // Computes the minimum bit width for the current table size and stores it in bits.
-  pub fn finalize(&mut self) {
-    self.bits = BitpackedArray::min_bits(self.values.len());
-  }
+	pub fn is_empty(&self) -> bool {
+		self.values.is_empty()
+	}
 }

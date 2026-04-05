@@ -6,17 +6,17 @@
 pub const LEAF_FLAG: u32 = 1 << 31;
 
 pub fn is_leaf(child: u32) -> bool {
-  child & LEAF_FLAG != 0
+	child & LEAF_FLAG != 0
 }
 
 pub fn leaf_value(child: u32) -> u32 {
-  child & !LEAF_FLAG
+	child & !LEAF_FLAG
 }
 
 pub fn make_leaf(value: u32) -> u32 {
-  value | LEAF_FLAG
+	value | LEAF_FLAG
 }
 
 pub fn child_count(occupancy: u64) -> u32 {
-  occupancy.count_ones()
+	occupancy.count_ones()
 }

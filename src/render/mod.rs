@@ -1,9 +1,9 @@
 #![allow(unused)]
-pub mod tracer;
 pub mod camera;
-pub mod traverse;
-pub mod gi;
 pub mod debug;
+pub mod gi;
+pub mod tracer;
+pub mod traverse;
 
-pub use tracer::Renderer;
 pub use camera::Camera;
+pub use tracer::Renderer;

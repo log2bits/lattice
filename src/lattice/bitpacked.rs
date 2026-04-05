@@ -1,51 +1,111 @@
-// A flat array of fixed-width values packed at a power-of-two bit width.
-// Bit widths: 1, 2, 4, 8, 16, 32. The GPU extracts any entry with a single
-// shift and mask. Backing storage is Vec<u32> for GPU compatibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitpackedArray {
-  pub data: Vec<u32>,
-  pub bits: u8,
-  pub len:  usize,
+	pub data: Vec<u32>,
+	pub bits: u8,
+	pub len: u32,
+}
+
+impl Default for BitpackedArray {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl BitpackedArray {
-  pub fn new(bits: u8) -> Self {
-    assert!(matches!(bits, 1 | 2 | 4 | 8 | 16 | 32));
-    Self { data: Vec::new(), bits, len: 0 }
-  }
+	pub fn new() -> Self {
+		Self {
+			data: Vec::new(),
+			bits: 1,
+			len: 0,
+		}
+	}
 
-  pub fn with_capacity(bits: u8, cap: usize) -> Self {
-    assert!(matches!(bits, 1 | 2 | 4 | 8 | 16 | 32));
-    let words = cap.div_ceil(32 / bits as usize);
-    Self { data: Vec::with_capacity(words), bits, len: 0 }
-  }
+	pub fn len(&self) -> u32 {
+		self.len
+	}
 
-  pub fn len(&self) -> usize {
-    self.len
-  }
+	pub fn is_empty(&self) -> bool {
+		self.len == 0
+	}
 
-  pub fn is_empty(&self) -> bool {
-    self.len == 0
-  }
+	pub fn clear(&mut self) {
+		self.data.clear();
+		self.bits = 1;
+		self.len = 0;
+	}
 
-  pub fn push(&mut self, value: u32) {
-    todo!()
-  }
+	#[inline]
+	pub fn push(&mut self, value: u32) {
+		if self.bits < 32 && value >> self.bits != 0 {
+			self.repack_in_place(((32 - value.leading_zeros()) as u8).next_power_of_two());
+		}
+		let bit_pos = self.len << self.bits.trailing_zeros();
+		if bit_pos & 31 == 0 {
+			self.data.push(0);
+		}
+		self.data[(bit_pos >> 5) as usize] |= value << (bit_pos & 31);
+		self.len += 1;
+	}
 
-  pub fn get(&self, index: usize) -> u32 {
-    todo!()
-  }
+	#[inline]
+	pub fn get(&self, index: u32) -> u32 {
+		let bit_pos = index << self.bits.trailing_zeros();
+		(self.data[(bit_pos >> 5) as usize] >> (bit_pos & 31)) & Self::mask(self.bits)
+	}
 
-  pub fn set(&mut self, index: usize, value: u32) {
-    todo!()
-  }
+	#[inline]
+	pub fn set(&mut self, index: u32, value: u32) {
+		let bit_pos = index << self.bits.trailing_zeros();
+		let bit_off = bit_pos & 31;
+		let mask = Self::mask(self.bits) << bit_off;
+		self.data[(bit_pos >> 5) as usize] =
+			(self.data[(bit_pos >> 5) as usize] & !mask) | (value << bit_off);
+	}
+	
+	pub fn repack_in_place(&mut self, new_bits: u8) {
+		assert!(matches!(new_bits, 1 | 2 | 4 | 8 | 16 | 32));
+		if new_bits == self.bits {
+			return;
+		}
+		let (old_bits, len) = (self.bits, self.len);
+		let new_word_count = ((len as usize * new_bits as usize) + 31) >> 5;
+		let growing = new_bits > old_bits;
+		if growing {
+			self.data.resize(new_word_count, 0);
+		}
+		for step in 0..len {
+			let entry = if growing { len - 1 - step } else { step };
+			let old_pos = entry << old_bits.trailing_zeros();
+			let value =
+				(self.data[(old_pos >> 5) as usize] >> (old_pos & 31)) & Self::mask(old_bits);
+			let new_pos = entry << new_bits.trailing_zeros();
+			let new_off = new_pos & 31;
+			let mask = Self::mask(new_bits) << new_off;
+			self.data[(new_pos >> 5) as usize] =
+				(self.data[(new_pos >> 5) as usize] & !mask) | (value << new_off);
+		}
+		if !growing {
+			self.data.truncate(new_word_count);
+		}
+		self.bits = new_bits;
+	}
 
-  // Returns a new BitpackedArray with the same values repacked at new_bits.
-  pub fn repack(&self, new_bits: u8) -> Self {
-    todo!()
-  }
+	pub fn repack(&self, new_bits: u8) -> Self {
+		let mut out = self.clone();
+		out.repack_in_place(new_bits);
+		out
+	}
 
-  // Minimum power-of-two bit width needed to represent `count` distinct indices.
-  pub fn min_bits(count: usize) -> u8 {
-    todo!()
-  }
+	pub fn min_bits(count: u32) -> u8 {
+		let bits = (32 - count.saturating_sub(1).leading_zeros()).max(1) as u8;
+		bits.next_power_of_two()
+	}
+
+	fn mask(bits: u8) -> u32 {
+		if bits == 32 {
+			u32::MAX
+		} else {
+			(1u32 << bits) - 1
+		}
+	}
 }

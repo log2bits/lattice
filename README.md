@@ -23,6 +23,7 @@ Each stage is independent. The handoff between stages is a well-defined data str
 - Every level uses SoA layout. No AoS.
 - All voxel references resolve through the global voxel LUT to a fixed 32-bit format. Per-section-root LUTs and pool-size bitpacking compress the intermediate indices. The `Lut<T>` + `BitpackedArray` primitives are reused for all of these.
 - The renderer is always full path tracing. No rasterization fallback, no hybrid primary visibility.
+- All domain counts and indices are `u32`. `usize` is only used at `Vec` indexing call sites.
 - Face normals are derived from the DDA exit face at traversal time. No per-voxel normals are stored.
 - No LOD. Every ray traverses to the leaf.
 - No editing during rendering. The data is built once and uploaded. Read-only at runtime.
@@ -98,12 +99,12 @@ Child entries at the bottom of a section are global voxel LUT indices. These get
 
 ## LUT compression
 
-The core primitive is a `BitpackedArray`: a flat array of values stored at a fixed power-of-two bit width (1, 2, 4, 8, 16, or 32). Powers of two mean the GPU extracts any entry with a single shift and mask. `BitpackedArray` supports converting its bit width after construction, which is how both compression strategies finalize their storage: build with full u32 values, determine the minimum bit width once sizes are known, repack.
+The core primitive is a `BitpackedArray`: a flat array of values stored at a power-of-two bit width (1, 2, 4, 8, 16, or 32). Powers of two mean the GPU extracts any entry with a single shift and mask. The bit width starts at 1 and grows automatically: pushing a value that doesn't fit triggers a repack to the next sufficient width. No manual repack step needed.
 
-On top of `BitpackedArray` is a generalized `Lut<T>`: a flat array of unique values of type `T`, plus a `BitpackedArray` of indices into those values. This pattern appears four times in the structure:
+On top of `BitpackedArray` is `Lut`: a flat array of unique `u32` values, referenced by index. Callers store those indices in a `BitpackedArray`, which grows automatically as new indices are pushed. This pattern appears four times in the structure:
 
 1. **DAG node pools** -- each node pool is a set of unique nodes; intra-section child pointers are bitpacked indices into it. The pool IS the value table. No separate index array is needed since the pool indices are already sequential.
-2. **Global voxel LUT** -- all unique 32-bit voxels in the scene, deduplicated across all sections. Everything ultimately resolves to an index into this table.
+2. **Global voxel LUT** -- all unique 32-bit voxels in the scene, deduplicated across all sections. Up to 2^32 unique voxels are supported. For gltf scenes with the 256-entry color palette, the upper bound is 256 colors * 256 roughness and material flag combinations = 65536 unique voxels, so `voxel_bits` is at most 16.
 3. **Per-section-root LUT** -- for each section root, a local table of the unique global voxel LUT indices its subtree references. In-tree leaf entries are bitpacked local indices into this table.
 4. **Materials array LUT** -- for Geometry DAG sections, the Dolonius materials array is bitpacked global voxel LUT indices. A small LUT of unique global indices maps the compressed stream entries to actual voxel data.
 
@@ -162,7 +163,7 @@ The shader always decodes the same layout. No per-scene variants, no header fiel
 
 The color palette is a perceptually uniform 256-entry spread across OKLab space, precomputed using sample elimination. It doesn't change between scenes. At import, each sampled surface point maps to its nearest palette entry, which sets the 24-bit RGB field of the voxel.
 
-Using the palette keeps the global voxel LUT small. With 256 possible colors and a handful of material flag combinations, the total unique voxel count is bounded and typically sits in the low thousands. A smaller global voxel LUT means smaller `voxel_bits`, which reduces the cost of every per-section-root LUT entry and every materials array entry across the entire scene.
+The palette bounds the color component of the global voxel LUT. With 256 palette colors and 256 roughness and material flag combinations, a gltf scene has at most 65536 unique voxels and `voxel_bits` tops out at 16. Scenes imported without palette quantization can have up to 2^32 unique voxels. A smaller `voxel_bits` reduces the cost of every per-section-root LUT entry and every materials array entry across the entire scene.
 
 ---
 
@@ -180,7 +181,7 @@ let lattice = Lattice::new(&[
 ```
 
 - Section 1, Grid (1 level): spatial index into the geometry DAG trees below.
-- Section 2, Geometry DAG (3 levels): deduplicates block geometry. Material data lives in the materials array in Dolonius DFS order, bitpacked at `voxel_bits`. Each section root gets a local LUT of the global voxel LUT indices its subtree references. Most trees only touch a small slice of the global table so local indices compress to 8 bits or fewer.
+- Section 2, Geometry DAG (3 levels): deduplicates block geometry. Material data lives in the materials array in Dolonius DFS order, bitpacked at `voxel_bits`. Each section root gets a local LUT of the global voxel LUT indices its subtree references. Most trees only touch a small slice of the global table so local indices are much narrower than `voxel_bits`.
 
 ### Minecraft world
 
@@ -336,7 +337,7 @@ lattice/
       node.rs         # LEAF_FLAG and child entry helpers
       voxel.rs        # Voxel (32-bit format), ColorPalette
       bitpacked.rs    # BitpackedArray -- fixed-width packed storage, width conversion
-      lut.rs          # Lut<T> -- unique value table + BitpackedArray of indices
+      lut.rs          # Lut -- unique u32 value table, auto-updating bit width
 
     import/
       mod.rs          # importer entry point, VoxelChunk output type
