@@ -1,4 +1,4 @@
-use lattice::load::load;
+use lattice::load::load_lattice;
 use lattice::render::{Camera, Renderer};
 use std::path::PathBuf;
 

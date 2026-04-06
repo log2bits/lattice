@@ -1,15 +1,14 @@
 pub mod dag;
-pub mod lut;
 pub mod materials;
 pub mod serialize;
 pub mod sort;
 
 use crate::import::VoxelSample;
-use crate::lattice::{Lattice, SectionConfig};
+use crate::lattice::Lattice;
 use std::path::Path;
 
 pub struct PackConfig {
-	pub sections: Vec<SectionConfig>,
+	pub dag_depth: u8,
 	pub world_min: [i64; 3],
 	pub world_max: [i64; 3],
 }

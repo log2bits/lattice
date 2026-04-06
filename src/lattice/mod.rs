@@ -2,20 +2,17 @@ pub mod bitpacked;
 pub mod geometry_dag;
 pub mod grid;
 pub mod lut;
-pub mod material_dag;
 pub mod node;
 pub mod voxel;
 
 pub use bitpacked::BitpackedArray;
 pub use geometry_dag::{GeometryDagLevel, GeometryDagRoot};
 pub use grid::GridLevel;
-pub use lut::Lut;
-pub use material_dag::{MaterialDagLevel, MaterialDagRoot};
+pub use lut::{Lut, MaterialsArray};
 pub use node::{LEAF_FLAG, child_count, is_leaf, leaf_value, make_leaf};
 pub use voxel::{ColorPalette, Voxel};
 
-// Stack-allocated iterator over the children of a DAG node. Returned by
-// children_of() on GeometryDagLevel and MaterialDagLevel.
+// Stack-allocated iterator over the children of a DAG node.
 pub struct ChildIter<'a> {
 	arr: &'a BitpackedArray,
 	pos: u32,
@@ -24,7 +21,11 @@ pub struct ChildIter<'a> {
 
 impl<'a> ChildIter<'a> {
 	pub(crate) fn new(arr: &'a BitpackedArray, start: u32, end: u32) -> Self {
-		Self { arr, pos: start, end }
+		Self {
+			arr,
+			pos: start,
+			end,
+		}
 	}
 }
 
@@ -41,77 +42,29 @@ impl<'a> Iterator for ChildIter<'a> {
 	}
 }
 
-// Configuration for one section. Passed to Lattice::new to describe the
-// desired structure before any data is built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerType {
-	Grid,
-	GeometryDag,
-	MaterialDag,
-}
-
-pub struct SectionConfig {
-	pub layer: LayerType,
-	pub num_levels: u8,
-	pub lut: bool,
-}
-
-impl SectionConfig {
-	pub fn grid(num_levels: u8) -> Self {
-		Self { layer: LayerType::Grid, num_levels, lut: false }
-	}
-
-	pub fn geometry_dag(num_levels: u8) -> Self {
-		Self { layer: LayerType::GeometryDag, num_levels, lut: false }
-	}
-
-	pub fn material_dag(num_levels: u8) -> Self {
-		Self { layer: LayerType::MaterialDag, num_levels, lut: false }
-	}
-
-	pub fn with_lut(mut self) -> Self {
-		self.lut = true;
-		self
-	}
-}
-
-// The data for one section. Each variant carries exactly the types and fields
-// it needs -- no Options, no unused fields, no shared root struct that forces
-// a common layout on different section types.
+// The fully-built in-memory lattice. One grid of DAG roots, all sharing the
+// same pool of geometry levels. Roots are loaded from disk as full trees and
+// kept in RAM. VRAM gets partial-depth uploads based on camera distance.
 //
-// To add a new layer type (e.g. SSVDAG), add a new file with the level and root
-// structs, then add a variant here. The compiler will point out every match arm
-// that needs updating.
-pub enum SectionData {
-	Grid(GridLevel),
-	GeometryDag {
-		levels: Vec<GeometryDagLevel>,
-		roots: Vec<GeometryDagRoot>,
-	},
-	MaterialDag {
-		levels: Vec<MaterialDagLevel>,
-		roots: Vec<MaterialDagRoot>,
-	},
-}
-
-pub struct Section {
-	pub config: SectionConfig,
-	pub data: SectionData,
-}
-
-// The fully-built lattice. All voxel references in the tree resolve through
-// voxel_lut to a fixed 32-bit format. voxel_bits is the bit width used for
-// those indices throughout the tree.
+// dag_depth: number of geometry levels. The tree covers (4^dag_depth)^3 voxels
+// per root. Depth 3 = 64^3 voxels, depth 4 = 256^3, depth 5 = 1024^3.
 pub struct Lattice {
-	pub sections: Vec<Section>,
-	pub voxel_lut: Vec<Voxel>,
-	pub voxel_bits: u8,
+	pub grid: GridLevel,
+	pub dag_depth: u8,
+	pub levels: Vec<GeometryDagLevel>, // shared geometry pool, dag_depth levels
+	pub roots: Vec<GeometryDagRoot>,
 	pub palette: ColorPalette,
 }
 
 impl Lattice {
-	pub fn new(configs: Vec<SectionConfig>) -> Self {
-		todo!()
+	pub fn new(dag_depth: u8) -> Self {
+		Self {
+			grid: GridLevel::new(),
+			dag_depth,
+			levels: (0..dag_depth).map(|_| GeometryDagLevel::new()).collect(),
+			roots: Vec::new(),
+			palette: ColorPalette::new(),
+		}
 	}
 }
 
@@ -120,11 +73,9 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn minecraft_lattice() {
-		let _lattice = Lattice::new(vec![
-			SectionConfig::grid(1),
-			SectionConfig::geometry_dag(3).with_lut(),
-			SectionConfig::material_dag(2).with_lut(),
-		]);
+	fn build_empty_lattice() {
+		let lattice = Lattice::new(3);
+		assert_eq!(lattice.dag_depth, 3);
+		assert_eq!(lattice.levels.len(), 3);
 	}
 }

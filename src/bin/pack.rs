@@ -1,6 +1,5 @@
 use lattice::import::ImportConfig;
 use lattice::import::gltf::import_gltf;
-use lattice::lattice::SectionConfig;
 use lattice::pack::{PackConfig, pack};
 use std::path::PathBuf;
 
@@ -23,10 +22,7 @@ fn main() -> Result<(), anyhow::Error> {
 	let samples = import_gltf(&input, &import_config)?;
 
 	let pack_config = PackConfig {
-		sections: vec![
-			SectionConfig::grid(1),
-			SectionConfig::geometry_dag(3).with_lut(),
-		],
+		dag_depth: 3,
 		world_min: import_config.world_min,
 		world_max: import_config.world_max,
 	};
