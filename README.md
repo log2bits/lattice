@@ -52,9 +52,11 @@ Each tree node covers a 4x4x4 block of children (64 slots). The `child_mask` fie
 Each level is SoA:
 
 - `child_mask: Vec<u64>` -- one bit per child slot. A 1 bit means a child exists there.
-- `child_start: Vec<u32>` -- where this node's children begin in the flat children array.
-- `rep_material: Vec<u32>` -- per-chunk LUT index, blended bottom-up from children. Used for LOD early termination.
-- `children: BitpackedArray` -- packed child entries, bitpacked at the minimum width for the pool size.
+- `leaf_mask: Vec<u64>` -- which occupied children are uniform (leaf) entries vs node pointers.
+- `child_start: Vec<u32>` -- where this node's children begin in the two children arrays.
+- `rep_material: BitpackedArray` -- per-chunk LUT index per node, blended bottom-up from children. Bitpacked at `ceil(log2(lut_size))` bits. Used for LOD early termination.
+- `ptr_children: BitpackedArray` -- node pointer children, bitpacked at `ceil(log2(node_pool_size))` bits.
+- `lut_children: BitpackedArray` -- uniform subtree LUT indices, bitpacked at `ceil(log2(lut_size))` bits.
 
 A child entry is either:
 - `LEAF_FLAG | lut_index`: uniform subtree, all voxels have material `lut_index`. Traversal terminates here.
@@ -82,6 +84,20 @@ Lut
 ```
 
 The bit width of child LUT indices is determined by the LUT size. A chunk with 16 unique voxels uses 4-bit index fields. One with 200 uses 8-bit. Compression is local to each chunk.
+
+### Bitpacking strategy
+
+Mixing node pointers and `LEAF_FLAG | lut_index` entries in the same array breaks compression. `LEAF_FLAG` is bit 31, so any entry with it set looks like a large number and forces the array to widen to 32 bits, regardless of LUT size.
+
+The fix is to never mix them. Each level's children split into two separate bitpacked arrays, selected by a `leaf_mask`:
+
+- `leaf_mask: u64` -- which occupied children are uniform (LEAF_FLAG) entries. Sits alongside `child_mask` in the SoA.
+- pointer children: bitpacked at `ceil(log2(node_pool_size))` bits. Width set once per level after construction.
+- leaf children: bitpacked at `ceil(log2(lut_size))` bits. Width set once per chunk.
+
+The deepest level has no node pointers at all, only leaf children, so it uses only the leaf array. `rep_material` is also just a LUT index and gets the same treatment: stored as a bitpacked array at `ceil(log2(lut_size))` bits per node rather than a flat `Vec<u32>`.
+
+The result is that palette compression applies everywhere LUT indices appear: leaf children at all levels, rep_material at all levels. A chunk with 16 unique voxels stores all of that data at 4 bits per entry.
 
 ---
 
@@ -223,12 +239,15 @@ Chunks:
 
 ```
 LVL*    one chunk per SVO level (* = level index, 0 = root level)
-  node_count:       u32
-  child_mask:       [u64; node_count]
-  rep_material:     [u32; node_count]
-  child_start:      [u32; node_count]
-  children:         [u8; ...]           bitpacked, DFS order
-  child_bits:       u8
+  node_count:         u32
+  child_mask:         [u64; node_count]
+  leaf_mask:          [u64; node_count]
+  child_start:        [u32; node_count]
+  rep_material:       [u8; ...]           bitpacked LUT indices at lut_bits
+  ptr_children:       [u8; ...]           bitpacked node pointers at ptr_bits
+  lut_children:       [u8; ...]           bitpacked LUT indices at lut_bits
+  ptr_bits:           u8                  bit width for node pointers
+  lut_bits:           u8                  bit width for LUT indices (ceil(log2(lut_size)))
 
 ROOT*   one chunk per root (* = chunk index)
   root_node_index:  u32
