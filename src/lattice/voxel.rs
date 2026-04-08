@@ -12,13 +12,7 @@
 pub struct Voxel(pub u32);
 
 impl Voxel {
-	pub fn new(
-		rgb: [u8; 3],
-		roughness: u8,
-		emissive: bool,
-		metallic: bool,
-		transparent: bool,
-	) -> Self {
+	pub fn new(rgb: [u8; 3], roughness: u8, emissive: bool, metallic: bool, transparent: bool) -> Self {
 		Voxel(
 			((rgb[0] as u32) << 24)
 				| ((rgb[1] as u32) << 16)
@@ -31,11 +25,7 @@ impl Voxel {
 	}
 
 	pub fn rgb(self) -> [u8; 3] {
-		[
-			(self.0 >> 24) as u8,
-			(self.0 >> 16) as u8,
-			(self.0 >> 8) as u8,
-		]
+		[(self.0 >> 24) as u8, (self.0 >> 16) as u8, (self.0 >> 8) as u8]
 	}
 	pub fn roughness(self) -> u8 {
 		((self.0 >> 4) & 0xF) as u8
@@ -60,32 +50,5 @@ impl From<u32> for Voxel {
 impl From<Voxel> for u32 {
 	fn from(v: Voxel) -> Self {
 		v.0
-	}
-}
-
-// 256-entry perceptually uniform color palette in OKLab space, precomputed
-// once using sample elimination. Used at import time to quantize scene colors,
-// bounding the global voxel LUT to a manageable size.
-#[derive(Clone, Debug, Default)]
-pub struct ColorPalette {
-	pub entries: Vec<[u8; 3]>,
-}
-
-impl ColorPalette {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	pub fn len(&self) -> u32 {
-		self.entries.len() as u32
-	}
-
-	pub fn is_empty(&self) -> bool {
-		self.entries.is_empty()
-	}
-
-	// Returns the index of the nearest palette entry to the given linear RGB.
-	pub fn nearest(&self, rgb: [u8; 3]) -> u8 {
-		todo!()
 	}
 }

@@ -17,9 +17,9 @@ fn main() -> Result<(), anyhow::Error> {
 		voxel_size: 0.01,
 		world_min: [-1024, -1024, -1024],
 		world_max: [1024, 1024, 1024],
+		chunk_size: 64,
+		palette_path: std::path::PathBuf::from("assets/colors/palette_256.png"),
 	};
-
-	let samples = import_gltf(&input, &import_config)?;
 
 	let pack_config = PackConfig {
 		dag_depth: 3,
@@ -27,7 +27,9 @@ fn main() -> Result<(), anyhow::Error> {
 		world_max: import_config.world_max,
 	};
 
-	pack(pack_config, samples, &output)?;
+	let mut packer = pack(pack_config, &output)?;
+	import_gltf(&input, &import_config, |chunk| packer.add_chunk(chunk))?;
+	packer.finish()?;
 	eprintln!("Written to {}", output.display());
 	Ok(())
 }

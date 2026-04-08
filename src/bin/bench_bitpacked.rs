@@ -6,11 +6,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 fn bench_push_uniform(bits: u8, count: u32) -> f64 {
-	let max_val = if bits == 32 {
-		u32::MAX
-	} else {
-		(1u32 << bits) - 1
-	};
+	let max_val = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
 	let mut arr = BitpackedArray::new();
 
 	let t = Instant::now();
@@ -47,10 +43,7 @@ fn bench_repacks() {
 	];
 
 	println!("\nrepack timings (filling array first, then triggering repack):");
-	println!(
-		"{:<12} {:>10} {:>10} {:>12}",
-		"transition", "entries", "repack ns", "ns/entry"
-	);
+	println!("{:<12} {:>10} {:>10} {:>12}", "transition", "entries", "repack ns", "ns/entry");
 
 	for &(trigger_val, old_bits, new_bits) in transitions {
 		// Fill array to ~1M entries at old_bits width
@@ -105,14 +98,8 @@ fn bench_stress() {
 	let get_elapsed = t.elapsed();
 
 	println!("  final bits: {}", arr.bits);
-	println!(
-		"  push: {:.1}M/s",
-		count as f64 / push_elapsed.as_secs_f64() / 1e6
-	);
-	println!(
-		"  get:  {:.1}M/s",
-		count as f64 / get_elapsed.as_secs_f64() / 1e6
-	);
+	println!("  push: {:.1}M/s", count as f64 / push_elapsed.as_secs_f64() / 1e6);
+	println!("  get:  {:.1}M/s", count as f64 / get_elapsed.as_secs_f64() / 1e6);
 	println!("  all {} values verified correct", count);
 }
 
@@ -140,11 +127,7 @@ fn main() {
 	println!("{:<8} {:>12} {:>12}", "bits", "count", "entries/sec");
 
 	for &(bits, count) in configs {
-		let max_val = if bits == 32 {
-			u32::MAX
-		} else {
-			(1u32 << bits) - 1
-		};
+		let max_val = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
 		let mut arr = BitpackedArray::new();
 		for i in 0..count {
 			arr.push(i % (max_val + 1).max(1));

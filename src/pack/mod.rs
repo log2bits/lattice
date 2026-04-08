@@ -13,11 +13,24 @@ pub struct PackConfig {
 	pub world_max: [i64; 3],
 }
 
-// Builds a Lattice from a VoxelSample stream and writes it to a .lattice file.
-pub fn pack(
+pub struct Packer {
 	config: PackConfig,
-	samples: Vec<VoxelSample>,
-	out: &Path,
-) -> Result<(), anyhow::Error> {
-	todo!()
+	out: std::path::PathBuf,
+}
+
+impl Packer {
+	// Feed one Morton-sorted chunk of samples. Chunks must arrive in Morton order.
+	pub fn add_chunk(&mut self, samples: Vec<VoxelSample>) {
+		todo!()
+	}
+
+	// Finalize the DAG and write the .lattice file.
+	pub fn finish(self) -> Result<(), anyhow::Error> {
+		todo!()
+	}
+}
+
+// Creates a Packer that builds a Lattice from a sorted VoxelSample stream and writes it to a .lattice file.
+pub fn pack(config: PackConfig, out: &Path) -> Result<Packer, anyhow::Error> {
+	Ok(Packer { config, out: out.to_path_buf() })
 }

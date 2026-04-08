@@ -29,11 +29,7 @@ fn main() -> Result<(), anyhow::Error> {
 			2 => "MaterialDag",
 			_ => "Unknown",
 		};
-		println!(
-			"  section {i}: {layer} x{} lut={}",
-			sec.num_levels,
-			sec.lut_enabled != 0
-		);
+		println!("  section {i}: {layer} x{} lut={}", sec.num_levels, sec.lut_enabled != 0);
 	}
 
 	Ok(())

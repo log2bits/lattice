@@ -10,7 +10,7 @@ pub use geometry_dag::{GeometryDagLevel, GeometryDagRoot};
 pub use grid::GridLevel;
 pub use lut::{Lut, MaterialsArray};
 pub use node::{LEAF_FLAG, child_count, is_leaf, leaf_value, make_leaf};
-pub use voxel::{ColorPalette, Voxel};
+pub use voxel::Voxel;
 
 // Stack-allocated iterator over the children of a DAG node.
 pub struct ChildIter<'a> {
@@ -21,11 +21,7 @@ pub struct ChildIter<'a> {
 
 impl<'a> ChildIter<'a> {
 	pub(crate) fn new(arr: &'a BitpackedArray, start: u32, end: u32) -> Self {
-		Self {
-			arr,
-			pos: start,
-			end,
-		}
+		Self { arr, pos: start, end }
 	}
 }
 
@@ -53,17 +49,15 @@ pub struct Lattice {
 	pub dag_depth: u8,
 	pub levels: Vec<GeometryDagLevel>, // shared geometry pool, dag_depth levels
 	pub roots: Vec<GeometryDagRoot>,
-	pub palette: ColorPalette,
 }
 
 impl Lattice {
-	pub fn new(dag_depth: u8) -> Self {
+	pub fn new(dag_depth: u8, grid_dims: [u32; 3]) -> Self {
 		Self {
-			grid: GridLevel::new(),
+			grid: GridLevel::new(grid_dims),
 			dag_depth,
 			levels: (0..dag_depth).map(|_| GeometryDagLevel::new()).collect(),
 			roots: Vec::new(),
-			palette: ColorPalette::new(),
 		}
 	}
 }
@@ -74,7 +68,7 @@ mod tests {
 
 	#[test]
 	fn build_empty_lattice() {
-		let lattice = Lattice::new(3);
+		let lattice = Lattice::new(3, [16, 16, 16]);
 		assert_eq!(lattice.dag_depth, 3);
 		assert_eq!(lattice.levels.len(), 3);
 	}

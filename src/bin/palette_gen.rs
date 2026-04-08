@@ -52,13 +52,7 @@ fn oklab_to_srgb(lab: [f32; 3]) -> [u8; 3] {
 	for _ in 0..24 {
 		let mid = (lo + hi) / 2.0;
 		let s: Srgb<f32> = Srgb::from_color(Oklab::from_color(Oklch::new(lch.l, mid, lch.hue)));
-		if s.red >= 0.0
-			&& s.red <= 1.0
-			&& s.green >= 0.0
-			&& s.green <= 1.0
-			&& s.blue >= 0.0
-			&& s.blue <= 1.0
-		{
+		if s.red >= 0.0 && s.red <= 1.0 && s.green >= 0.0 && s.green <= 1.0 && s.blue >= 0.0 && s.blue <= 1.0 {
 			lo = mid;
 		} else {
 			hi = mid;
@@ -136,10 +130,7 @@ impl Grid {
 
 	fn insert(&mut self, idx: u32, lab: [f32; 3]) {
 		let (cx, cy, cz) = self.cell_of(lab);
-		self.cells
-			.entry(pack_key(cx, cy, cz))
-			.or_default()
-			.push(idx);
+		self.cells.entry(pack_key(cx, cy, cz)).or_default().push(idx);
 	}
 
 	fn remove(&mut self, idx: u32, lab: [f32; 3]) {
@@ -167,18 +158,11 @@ impl Grid {
 		let mut best2_dsq = f32::MAX;
 		let mut found = 0usize;
 
-		let full_cover_radius = [
-			cx,
-			self.max_cell[0] - cx,
-			cy,
-			self.max_cell[1] - cy,
-			cz,
-			self.max_cell[2] - cz,
-		]
-		.into_iter()
-		.max()
-		.unwrap()
-		.max(0);
+		let full_cover_radius = [cx, self.max_cell[0] - cx, cy, self.max_cell[1] - cy, cz, self.max_cell[2] - cz]
+			.into_iter()
+			.max()
+			.unwrap()
+			.max(0);
 
 		let mut s: i32 = 0;
 
@@ -194,11 +178,7 @@ impl Grid {
 						let ny = cy + dy;
 						let nz = cz + dz;
 
-						if nx < 0
-							|| ny < 0 || nz < 0 || nx > self.max_cell[0]
-							|| ny > self.max_cell[1]
-							|| nz > self.max_cell[2]
-						{
+						if nx < 0 || ny < 0 || nz < 0 || nx > self.max_cell[0] || ny > self.max_cell[1] || nz > self.max_cell[2] {
 							continue;
 						}
 
@@ -250,17 +230,9 @@ impl Grid {
 
 		(
 			best1_idx,
-			if best1_dsq == f32::MAX {
-				f32::MAX
-			} else {
-				best1_dsq.sqrt()
-			},
+			if best1_dsq == f32::MAX { f32::MAX } else { best1_dsq.sqrt() },
 			best2_idx,
-			if best2_dsq == f32::MAX {
-				f32::MAX
-			} else {
-				best2_dsq.sqrt()
-			},
+			if best2_dsq == f32::MAX { f32::MAX } else { best2_dsq.sqrt() },
 		)
 	}
 }
@@ -288,9 +260,7 @@ impl Eq for HeapEntry {}
 
 impl Ord for HeapEntry {
 	fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-		self.neg_d1_bits
-			.cmp(&o.neg_d1_bits)
-			.then(self.neg_rgb.cmp(&o.neg_rgb))
+		self.neg_d1_bits.cmp(&o.neg_d1_bits).then(self.neg_rgb.cmp(&o.neg_rgb))
 	}
 }
 
@@ -325,14 +295,14 @@ pub fn closest_pair_second_nn_elimination() -> Vec<u32> {
 
 	eprintln!("Measuring OKLab bounding box...");
 	let (min_lab, max_lab) = {
-		let mn = lut.par_iter().copied().reduce(
-			|| [f32::MAX; 3],
-			|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])],
-		);
-		let mx = lut.par_iter().copied().reduce(
-			|| [f32::MIN; 3],
-			|a, b| [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])],
-		);
+		let mn = lut
+			.par_iter()
+			.copied()
+			.reduce(|| [f32::MAX; 3], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])]);
+		let mx = lut
+			.par_iter()
+			.copied()
+			.reduce(|| [f32::MIN; 3], |a, b| [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])]);
 		(mn, mx)
 	};
 
@@ -351,10 +321,7 @@ pub fn closest_pair_second_nn_elimination() -> Vec<u32> {
 	eprintln!(" {} non-empty cells", grid.cells.len());
 
 	eprintln!("Computing initial 1st/2nd nearest neighbours (parallel)...");
-	let init: Vec<(u32, f32, u32, f32)> = (0..n as u32)
-		.into_par_iter()
-		.map(|i| grid.find_two_nn(lut[i as usize], i))
-		.collect();
+	let init: Vec<(u32, f32, u32, f32)> = (0..n as u32).into_par_iter().map(|i| grid.find_two_nn(lut[i as usize], i)).collect();
 
 	let mut nn1 = vec![u32::MAX; n];
 	let mut d1 = vec![f32::MAX; n];
@@ -527,10 +494,7 @@ pub fn closest_pair_second_nn_elimination() -> Vec<u32> {
 
 		let done = n - remaining;
 		if done % report_every == 0 || remaining == 2 {
-			eprintln!(
-				" {done}/{n} ({:.1}%) remaining={remaining}",
-				done as f64 / n as f64 * 100.0
-			);
+			eprintln!(" {done}/{n} ({:.1}%) remaining={remaining}", done as f64 / n as f64 * 100.0);
 		}
 	}
 
@@ -692,12 +656,7 @@ fn som_layout(labs: &[[f32; 3]]) -> Vec<usize> {
 	eprintln!("Computing optimal assignment (Hungarian)...");
 	let grid = hungarian(&weights, labs);
 
-	let darkest = labs
-		.iter()
-		.enumerate()
-		.min_by(|(_, a), (_, b)| a[0].total_cmp(&b[0]))
-		.map(|(i, _)| i)
-		.unwrap();
+	let darkest = labs.iter().enumerate().min_by(|(_, a), (_, b)| a[0].total_cmp(&b[0])).map(|(i, _)| i).unwrap();
 
 	let dark_pos = grid.iter().position(|&p| p == darkest).unwrap();
 	let sr = dark_pos / side;
@@ -746,8 +705,7 @@ fn generate_hald_clut(palette_labs: &[[f32; 3]], palette_rgb: &[[u8; 3]]) {
 	for (x, y, [r, g, b]) in pixels {
 		img.put_pixel(x, y, image::Rgb([r, g, b]));
 	}
-	img.save("assets/colors/palette_lut.png")
-		.expect("failed to save palette_lut.png");
+	img.save("assets/colors/palette_lut.png").expect("failed to save palette_lut.png");
 	eprintln!("Saved palette_lut.png.");
 }
 
@@ -756,10 +714,7 @@ pub fn generate(size: usize, order: &[u32]) -> Vec<[u8; 3]> {
 	let side = (size as f32).sqrt() as usize;
 	assert_eq!(side * side, size, "size must be a perfect square");
 
-	let colors: Vec<[u8; 3]> = order[order.len() - size..]
-		.iter()
-		.map(|&idx| idx_to_rgb(idx as usize))
-		.collect();
+	let colors: Vec<[u8; 3]> = order[order.len() - size..].iter().map(|&idx| idx_to_rgb(idx as usize)).collect();
 
 	let mut taken: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
 	let mut colors = colors;
@@ -775,11 +730,7 @@ pub fn generate(size: usize, order: &[u32]) -> Vec<[u8; 3]> {
 				.enumerate()
 				.map(|(j, &l)| {
 					let rgb = idx_to_rgb(j);
-					let penalty = if taken_snap.contains(&rgb) {
-						f32::MAX
-					} else {
-						dist_sq(l, lab)
-					};
+					let penalty = if taken_snap.contains(&rgb) { f32::MAX } else { dist_sq(l, lab) };
 					(penalty, rgb)
 				})
 				.min_by(|(a, _), (b, _)| a.total_cmp(b))
@@ -800,17 +751,11 @@ pub fn generate(size: usize, order: &[u32]) -> Vec<[u8; 3]> {
 	let mut img = image::RgbImage::new(side as u32, side as u32);
 	for (pos, &idx) in layout.iter().enumerate() {
 		let [r, g, b] = colors[idx];
-		img.put_pixel(
-			(pos % side) as u32,
-			(pos / side) as u32,
-			image::Rgb([r, g, b]),
-		);
+		img.put_pixel((pos % side) as u32, (pos / side) as u32, image::Rgb([r, g, b]));
 	}
 	img.save(&path).expect("failed to save palette.png");
 
-	let saved = image::open(path)
-		.expect("failed to re-open palette.png")
-		.into_rgb8();
+	let saved = image::open(path).expect("failed to re-open palette.png").into_rgb8();
 	let mut set: std::collections::HashSet<[u8; 3]> = colors.iter().cloned().collect();
 	let mut mismatches = 0;
 	for pixel in saved.pixels() {
@@ -848,14 +793,8 @@ fn main() {
 	let mode = args.get(1).map(|s| s.as_str()).unwrap_or("all");
 
 	eprintln!("Building OKLab LUT ({NUM_COLORS} colours)...");
-	let lut: Vec<[f32; 3]> = (0..NUM_COLORS)
-		.into_par_iter()
-		.map(|i| rgb_to_oklab(idx_to_rgb(i)))
-		.collect();
-	eprintln!(
-		"LUT ready (~{}MB).",
-		std::mem::size_of_val(lut.as_slice()) / 1_000_000
-	);
+	let lut: Vec<[f32; 3]> = (0..NUM_COLORS).into_par_iter().map(|i| rgb_to_oklab(idx_to_rgb(i))).collect();
+	eprintln!("LUT ready (~{}MB).", std::mem::size_of_val(lut.as_slice()) / 1_000_000);
 	LUT.set(lut).ok();
 
 	match mode {
@@ -876,20 +815,13 @@ fn main() {
 				.expect("assets/colors/palette_generator.png not found -- run 'elim' first")
 				.into_rgb8();
 
-			let order: Vec<u32> = img
-				.pixels()
-				.map(|p| rgb_to_idx([p[0], p[1], p[2]]) as u32)
-				.collect();
+			let order: Vec<u32> = img.pixels().map(|p| rgb_to_idx([p[0], p[1], p[2]]) as u32).collect();
 
 			generate(n, &order);
 		}
 
 		"all" => {
-			let n: usize = args
-				.get(2)
-				.unwrap_or(&"256".to_string())
-				.parse()
-				.expect("N must be a positive integer");
+			let n: usize = args.get(2).unwrap_or(&"256".to_string()).parse().expect("N must be a positive integer");
 
 			let order = closest_pair_second_nn_elimination();
 			write_elimination_image(&order, "assets/colors/palette_generator.png");

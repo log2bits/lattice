@@ -1,14 +1,14 @@
 # Lattice
 
-A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses the geometry into a sparse voxel DAG, and renders via GPU path tracing. The depth of the DAG is the only configurable parameter. Everything else about the structure is fixed and uniform, which keeps the GPU traversal simple and the file format straightforward.
+A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses the geometry into a sparse voxel DAG, and renders via GPU path tracing. The depth of the DAG is the only configurable parameter. Everything else about the structure is fixed and uniform, which keeps GPU traversal simple and the file format clean.
 
 ---
 
 ## Pipeline
 
 ```
-[import]   scene -> sorted (position, voxel) stream
-[pack]     sorted voxel stream -> Lattice (grid + DAG levels + roots) -> .lattice file
+[import]   scene -> triangle bins -> per-chunk sorted runs -> k-way merged VoxelSample stream
+[pack]     sorted VoxelSample stream -> Lattice (grid + DAG levels + roots) -> .lattice file
 [load]     .lattice file -> RAM (full roots) -> VRAM (partial roots for LOD)
 [render]   GPU buffers -> path traced image
 ```
@@ -22,7 +22,7 @@ Each stage is independent. The handoff between stages is a well-defined data str
 - One layer type: Geometry DAG. No Material DAG, no SVO. No other types.
 - DAG deduplicates on geometry only (occupancy). Material data lives in a per-root MaterialsArray via the Dolonius method.
 - Every DAG level uses SoA layout. No AoS.
-- The grid is a flat 3D array of DAG root pointers. It grows automatically during construction to fit inserted roots.
+- The grid is a flat 3D array of DAG root pointers. Its dimensions are computed at build time from the scene bounds.
 - The only configurable parameter is `dag_depth`. Everything else is determined by it.
 - All domain counts and indices are `u32`. `usize` is only used at `Vec` indexing call sites.
 - Face normals are derived from the DDA exit face at traversal time. No per-voxel normals stored.
@@ -35,14 +35,13 @@ Each stage is independent. The handoff between stages is a well-defined data str
 
 ```
 Lattice
-  grid: GridLevel                    flat 3D array of root pointers (auto-sized)
+  grid: GridLevel                    flat 3D array of root pointers
   dag_depth: u8                      number of levels in the DAG
   levels: Vec<GeometryDagLevel>      shared geometry pool, dag_depth levels
   roots: Vec<GeometryDagRoot>        per-root material data and rep voxels
-  palette: ColorPalette              256-entry perceptually uniform OKLab palette
 ```
 
-The grid and the levels are shared across all roots. Two grid cells pointing to the same root index share all geometry and material data - the DAG deduplication means a brick arch appearing 10,000 times in a scene stores one geometry subtree.
+The grid and the levels are shared across all roots. Two grid cells pointing to the same root index share all geometry and material data. The DAG deduplication means a brick arch appearing 10,000 times in a scene stores one geometry subtree.
 
 ---
 
@@ -65,7 +64,7 @@ SoA layout matters for GPU traversal. A warp of 32 threads reading `occupancy` f
 
 ## Material data: Dolonius method
 
-Material data is stored in a flat 1D array (the MaterialsArray) per root, in Dolonius DFS order. During traversal, the ray maintains a running integer offset. At each descent step, the `voxel_count` of skipped sibling subtrees is added to the offset. When a leaf is hit, the offset points directly into the MaterialsArray.
+Material data is stored in a flat 1D array (the **MaterialsArray**) per root, in Dolonius DFS order. During traversal, the ray maintains a running integer offset. At each descent step, the `voxel_count` of skipped sibling subtrees is added to the offset. When a leaf is hit, the offset points directly into the MaterialsArray.
 
 This means geometry nodes carry no material payload at all. The DAG stays tight. The material lookup is one array read after traversal finishes.
 
@@ -78,10 +77,12 @@ Each root owns a `MaterialsArray`:
 ```
 MaterialsArray
   lut: Vec<Voxel>          unique voxels referenced by this root's subtree
-  indices: BitpackedArray  one lut index per leaf in Dolonius DFS order
+  indices: BitpackedArray   one lut index per leaf in Dolonius DFS order
 ```
 
-The bit width of `indices` is determined by the LUT size (`indices.bits`). A root with 16 unique voxels uses 4-bit indices. On disk, `lut` and `indices` are stored together in each root's chunk. The bit width is read from `indices.bits` at load time.
+The bit width of `indices` is determined by the LUT size. A root with 16 unique voxels uses 4-bit indices. On disk, `lut` and `indices` are stored together in each root's chunk. The bit width is read from `indices.bits` at load time.
+
+This is where all the palette-style compression happens. There's no separate color palette struct in the Lattice itself. Each root's MaterialsArray has its own LUT of unique `Voxel` values, and the `indices` array references into that LUT with the narrowest bit width that fits. A root with only 4 unique voxels uses 2-bit indices. One with 200 uses 8-bit. The compression is local to each root.
 
 ---
 
@@ -104,17 +105,33 @@ Voxel (32 bits):
 
 ---
 
-## The color palette
+## Import-time color palette
 
-The color palette is a perceptually uniform 256-entry spread across OKLab space, precomputed using sample elimination. It doesn't change between scenes. At import, each sampled surface point maps to its nearest palette entry, setting the 24-bit RGB field of the voxel.
+During glTF import, surface samples need to be mapped to discrete voxel colors. The importer uses a precomputed 256-entry color palette spread uniformly across OKLab space via sample elimination. Each sampled surface point is snapped to the nearest palette entry before it ever enters the Lattice.
 
-With 256 palette colors and 16 roughness levels plus material flags, a scene has at most a few thousand unique voxels per root. This keeps MaterialsArray LUT sizes small and index bit widths narrow.
+This palette only exists during import. It's not part of the Lattice structure. By the time voxels reach the packer, their RGB values are already set. The MaterialsArray LUT per root then further deduplicates on full 32-bit Voxel values (color + roughness + flags), so two voxels with the same palette color but different roughness are still distinct LUT entries.
+
+With 256 palette colors and 16 roughness levels plus material flags, a scene ends up with at most a few thousand unique voxels per root. This keeps MaterialsArray LUT sizes small and index bit widths narrow.
+
+---
+
+## Import chunking
+
+At dag_depth=8, each root is 4^8 = 65,536 voxels per side. Materializing all voxels for even a moderately dense scene before packing would exhaust RAM. Instead, the importer works in two phases.
+
+**Phase 1 — triangle binning.** One pass over all meshes builds a flat `Vec<Triangle>` and a bin map from chunk grid coordinates to triangle indices. Each triangle goes into every chunk whose AABB it overlaps. The flat triangle list stays in RAM throughout import; it's the smallest representation of the scene geometry.
+
+**Phase 2 — per-chunk voxelization.** For each occupied chunk cell, in Morton order: clip triangles to the chunk AABB, voxelize, sort the resulting `VoxelSample`s in Morton order, and emit the sorted run. The run is handed directly to the packer via callback, then dropped. Only one chunk's samples are in memory at a time.
+
+The chunk size (`ImportConfig::chunk_size`, voxels per side, must be a power of 4) is independent of `dag_depth`. It's purely a memory budget knob and has no effect on the output. Chunk boundaries are power-of-4 aligned in voxel space so Morton codes are contiguous within each run.
+
+The packer's k-way merge in `sort.rs` stitches the per-chunk sorted runs back into a globally ordered stream. This is load-bearing, not optional: for large roots a single in-memory sort of all voxels isn't feasible.
 
 ---
 
 ## Grid
 
-The grid is a flat 3D array of child entries. During construction, cells are inserted into a staging HashMap without needing to know the bounds upfront. `GridLevel::finalize()` computes the tight bounding dims and packs everything into a flat BitpackedArray.
+The grid is a flat 3D array of child entries. Its dimensions are determined at build time. When importing a glTF scene, the importer computes the axis-aligned bounding box of the entire scene in voxel space, then sizes the grid to cover that volume exactly. During construction, cells are inserted into a staging HashMap, and `GridLevel::finalize()` packs everything into a flat BitpackedArray using the known dimensions.
 
 Each grid entry is either:
 - A root index (clear LEAF_FLAG): real sub-DAG, data resident in VRAM
@@ -126,7 +143,7 @@ Each grid entry is either:
 
 Disk->RAM and RAM->VRAM are separate concerns with different granularities.
 
-**Disk->RAM:** full roots always. The streaming manager reads entire roots from disk into RAM ahead of time. Disk reads are slow and infrequent; they happen far enough in advance that they're never on the critical path.
+**Disk->RAM:** full roots always. The streaming manager reads entire roots from disk into RAM ahead of time. Disk reads are slow and infrequent. They happen far enough in advance that they're never on the critical path.
 
 **RAM->VRAM:** partial-depth uploads based on camera distance. RAM always holds the full tree for every loaded root. VRAM gets however many levels are needed given the camera's distance. LOD kicks in when a voxel at the current depth would subtend less than one pixel.
 
@@ -233,14 +250,12 @@ GRID    the spatial grid
   child_count:      u32
   children:         [u8; ...]           bitpacked grid entries at child_bits
 
-PAL     global color palette
-  entry_count:      u32                 always 256
-  entries:          [[u8; 3]; 256]      linear RGB, perceptually uniform OKLab spread
-
 SPIX    spatial index: maps 3D positions to root indices for the streaming manager
   entry_count:      u32
   entries:          [{pos: [i32; 3], root_index: u32}; entry_count]
 ```
+
+Note there's no palette chunk. The 256-color OKLab palette is only used during import to snap surface samples to discrete colors. By the time data hits the .lattice file, colors are baked into the Voxel values stored in each root's MaterialsArray LUT.
 
 ---
 
@@ -256,22 +271,22 @@ lattice/
       geometry_dag.rs # GeometryDagLevel (SoA), GeometryDagRoot (materials + rep_voxels)
       grid.rs         # GridLevel (flat 3D array, auto-sized via staging HashMap)
       node.rs         # LEAF_FLAG and child entry helpers
-      voxel.rs        # Voxel (repr(transparent) u32 newtype), ColorPalette
-      bitpacked.rs    # BitpackedArray -- fixed-width packed storage, Hash
+      voxel.rs        # Voxel (repr(transparent) u32 newtype)
+      bitpacked.rs    # BitpackedArray, fixed-width packed storage, Hash
       lut.rs          # Lut, MaterialsArray (LUT + bitpacked indices, owned per root)
 
     import/
-      mod.rs          # importer entry point, VoxelSample output type
-      palette.rs      # global color palette, nearest-entry lookup
+      mod.rs          # importer entry point, ImportConfig, VoxelSample
+      color.rs        # 256-entry OKLab color palette, nearest-entry lookup (import only)
       gltf/
-        mod.rs        # glTF scene loading, chunk dispatch
-        mesh.rs       # mesh data extraction, triangle clipping to chunks
+        mod.rs        # glTF scene loading: triangle binning + per-chunk voxelization
+        mesh.rs       # triangle extraction, Sutherland-Hodgman chunk clipping
         material.rs   # PBR material -> Voxel mapping
         voxelizer.rs  # SAT intersection test, texture sampling
 
     pack/
       mod.rs          # packing entry point, PackConfig
-      sort.rs         # k-way merge of sorted chunk streams (Morton order)
+      sort.rs         # k-way merge of per-chunk sorted runs into Morton-ordered stream
       dag.rs          # bottom-up streaming DAG construction
       lut.rs          # pool-size bitpacking after construction
       materials.rs    # Dolonius materials array construction
@@ -316,7 +331,7 @@ lattice/
 - PSVDAG-style encoding achieves 2.8-3.8x smaller files than pointer-based SVDAG.
 - Geometry DAG traversal runs from GPU L2 cache on typical scenes. Material-inline approaches push the node pool into VRAM bandwidth. For path tracing where traversal runs hundreds of times per pixel, this is a 3-8x practical difference.
 - Per-root MaterialsArrays mean LUT sizes reflect per-root voxel variety, not global variety. A root with 16 unique voxels uses 4-bit indices regardless of what the rest of the scene looks like.
-- LOD via rep_voxels costs no disk space. The rep_voxel array is computed in microseconds at load time from the MaterialsArray. The GPU sees LEAF_FLAG entries at the truncation depth and returns immediately -- the traversal algorithm is unchanged.
+- LOD via rep_voxels costs no disk space. The rep_voxel array is computed in microseconds at load time from the MaterialsArray. The GPU sees LEAF_FLAG entries at the truncation depth and returns immediately. The traversal algorithm is unchanged.
 - Streaming keeps disk->RAM and RAM->VRAM separate. RAM holds full roots, always. VRAM holds partial-depth roots based on camera distance. Disk reads are infrequent and off the critical path.
 
 ---

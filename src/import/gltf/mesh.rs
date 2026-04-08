@@ -6,10 +6,7 @@ pub struct Triangle {
 }
 
 // Extracts triangles from a glTF primitive.
-pub fn extract_triangles(
-	primitive: &gltf::Primitive,
-	buffers: &[gltf::buffer::Data],
-) -> Vec<Triangle> {
+pub fn extract_triangles(primitive: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Vec<Triangle> {
 	todo!()
 }
 

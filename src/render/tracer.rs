@@ -23,13 +23,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-	pub fn new(
-		device: wgpu::Device,
-		queue: wgpu::Queue,
-		lattice: GpuLattice,
-		width: u32,
-		height: u32,
-	) -> Self {
+	pub fn new(device: wgpu::Device, queue: wgpu::Queue, lattice: GpuLattice, width: u32, height: u32) -> Self {
 		todo!()
 	}
 
