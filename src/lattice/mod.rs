@@ -1,18 +1,18 @@
 pub mod bitpacked;
-pub mod geometry_dag;
 pub mod grid;
 pub mod lut;
 pub mod node;
+pub mod svo;
 pub mod voxel;
 
 pub use bitpacked::BitpackedArray;
-pub use geometry_dag::{GeometryDagLevel, GeometryDagRoot};
-pub use grid::GridLevel;
-pub use lut::{Lut, MaterialsArray};
+pub use grid::Grid;
+pub use lut::Lut;
 pub use node::{LEAF_FLAG, child_count, is_leaf, leaf_value, make_leaf};
+pub use svo::{Chunk, Level};
 pub use voxel::Voxel;
 
-// Stack-allocated iterator over the children of a DAG node.
+// Stack-allocated iterator over the children of a node.
 pub struct ChildIter<'a> {
 	arr: &'a BitpackedArray,
 	pos: u32,
@@ -38,26 +38,26 @@ impl<'a> Iterator for ChildIter<'a> {
 	}
 }
 
-// The fully-built in-memory lattice. One grid of DAG roots, all sharing the
-// same pool of geometry levels. Roots are loaded from disk as full trees and
+// The fully-built in-memory lattice. One grid of chunk pointers, all sharing
+// the same pool of SVO levels. Chunks are loaded from disk as full trees and
 // kept in RAM. VRAM gets partial-depth uploads based on camera distance.
 //
-// dag_depth: number of geometry levels. The tree covers (4^dag_depth)^3 voxels
-// per root. Depth 3 = 64^3 voxels, depth 4 = 256^3, depth 5 = 1024^3.
+// depth: number of SVO levels. The tree covers (4^depth)^3 voxels per chunk.
+// Depth 3 = 64^3 voxels, depth 4 = 256^3, depth 5 = 1024^3.
 pub struct Lattice {
-	pub grid: GridLevel,
-	pub dag_depth: u8,
-	pub levels: Vec<GeometryDagLevel>, // shared geometry pool, dag_depth levels
-	pub roots: Vec<GeometryDagRoot>,
+	pub grid: Grid,
+	pub depth: u8,
+	pub levels: Vec<Level>,  // shared node pools, one per depth level
+	pub chunks: Vec<Chunk>,
 }
 
 impl Lattice {
-	pub fn new(dag_depth: u8, grid_dims: [u32; 3]) -> Self {
+	pub fn new(depth: u8, grid_dims: [u32; 3]) -> Self {
 		Self {
-			grid: GridLevel::new(grid_dims),
-			dag_depth,
-			levels: (0..dag_depth).map(|_| GeometryDagLevel::new()).collect(),
-			roots: Vec::new(),
+			grid: Grid::new(grid_dims),
+			depth,
+			levels: (0..depth).map(|_| Level::new()).collect(),
+			chunks: Vec::new(),
 		}
 	}
 }
@@ -69,7 +69,7 @@ mod tests {
 	#[test]
 	fn build_empty_lattice() {
 		let lattice = Lattice::new(3, [16, 16, 16]);
-		assert_eq!(lattice.dag_depth, 3);
+		assert_eq!(lattice.depth, 3);
 		assert_eq!(lattice.levels.len(), 3);
 	}
 }

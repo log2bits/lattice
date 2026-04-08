@@ -1,14 +1,13 @@
-pub mod dag;
-pub mod materials;
+pub mod repack;
 pub mod serialize;
 pub mod sort;
+pub mod tree;
 
 use crate::import::VoxelSample;
-use crate::lattice::Lattice;
 use std::path::Path;
 
 pub struct PackConfig {
-	pub dag_depth: u8,
+	pub depth: u8,
 	pub world_min: [i64; 3],
 	pub world_max: [i64; 3],
 }
@@ -24,7 +23,7 @@ impl Packer {
 		todo!()
 	}
 
-	// Finalize the DAG and write the .lattice file.
+	// Finalize the SVO and write the .lattice file.
 	pub fn finish(self) -> Result<(), anyhow::Error> {
 		todo!()
 	}

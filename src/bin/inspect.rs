@@ -14,22 +14,15 @@ fn main() -> Result<(), anyhow::Error> {
 	let mut reader = BufReader::new(File::open(&input)?);
 	let header = parse_header(&mut reader)?;
 
-	println!("version:    {}", header.version);
-	println!("world_min:  {:?}", header.world_min);
-	println!("world_max:  {:?}", header.world_max);
-	println!("voxel_bits: {}", header.voxel_bits);
-	println!("sections:   {}", header.sections.len());
-	println!("levels:     {}", header.levels.len());
-	println!("chunks:     {}", header.chunks.len());
+	println!("version:     {}", header.version);
+	println!("world_min:   {:?}", header.world_min);
+	println!("world_max:   {:?}", header.world_max);
+	println!("depth:       {}", header.depth);
+	println!("chunk_count: {}", header.chunk_count);
+	println!("levels:      {}", header.levels.len());
 
-	for (i, sec) in header.sections.iter().enumerate() {
-		let layer = match sec.layer_type {
-			0 => "Grid",
-			1 => "GeometryDag",
-			2 => "MaterialDag",
-			_ => "Unknown",
-		};
-		println!("  section {i}: {layer} x{} lut={}", sec.num_levels, sec.lut_enabled != 0);
+	for (i, lvl) in header.levels.iter().enumerate() {
+		println!("  level {i}: {} nodes, {}-bit children", lvl.node_count, lvl.child_bits);
 	}
 
 	Ok(())

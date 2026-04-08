@@ -1,6 +1,6 @@
 # Lattice
 
-A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses the geometry into a sparse voxel DAG, and renders via GPU path tracing. The depth of the DAG is the only configurable parameter. Everything else about the structure is fixed and uniform, which keeps GPU traversal simple and the file format clean.
+A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses it into a sparse voxel 64-tree per chunk, and renders via GPU path tracing. The depth of the tree is the only configurable parameter. Everything else about the structure is fixed and uniform, which keeps GPU traversal simple and the file format clean.
 
 ---
 
@@ -8,8 +8,8 @@ A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses t
 
 ```
 [import]   scene -> triangle bins -> per-chunk sorted runs -> k-way merged VoxelSample stream
-[pack]     sorted VoxelSample stream -> Lattice (grid + DAG levels + roots) -> .lattice file
-[load]     .lattice file -> RAM (full roots) -> VRAM (partial roots for LOD)
+[pack]     sorted VoxelSample stream -> Lattice (grid + levels + chunks) -> .lattice file
+[load]     .lattice file -> RAM (full chunks) -> VRAM (partial depth for LOD)
 [render]   GPU buffers -> path traced image
 ```
 
@@ -19,11 +19,11 @@ Each stage is independent. The handoff between stages is a well-defined data str
 
 ## Design choices that are fixed
 
-- One layer type: Geometry DAG. No Material DAG, no SVO. No other types.
-- DAG deduplicates on geometry only (occupancy). Material data lives in a per-root MaterialsArray via the Dolonius method.
-- Every DAG level uses SoA layout. No AoS.
-- The grid is a flat 3D array of DAG root pointers. Its dimensions are computed at build time from the scene bounds.
-- The only configurable parameter is `dag_depth`. Everything else is determined by it.
+- One tree type: sparse voxel 64-tree (SVO). No DAG, no deduplication across chunks.
+- Materials are stored inline with the tree. Each node carries a representative material LUT index for LOD. Uniform subtrees store a single material and terminate early.
+- Every tree level uses SoA layout. No AoS.
+- The grid is a flat 3D array of chunk pointers. Its dimensions are computed at build time from the scene bounds.
+- The only configurable parameter is `depth`. Everything else is determined by it.
 - All domain counts and indices are `u32`. `usize` is only used at `Vec` indexing call sites.
 - Face normals are derived from the DDA exit face at traversal time. No per-voxel normals stored.
 - No editing during rendering. Data is built once and uploaded. Read-only at runtime.
@@ -35,54 +35,53 @@ Each stage is independent. The handoff between stages is a well-defined data str
 
 ```
 Lattice
-  grid: GridLevel                    flat 3D array of root pointers
-  dag_depth: u8                      number of levels in the DAG
-  levels: Vec<GeometryDagLevel>      shared geometry pool, dag_depth levels
-  roots: Vec<GeometryDagRoot>        per-root material data and rep voxels
+  grid: Grid                   flat 3D array of chunk pointers
+  depth: u8                    number of SVO levels
+  levels: Vec<Level>           shared node pools, one per depth level
+  chunks: Vec<Chunk>           per-chunk material palette and root node index
 ```
 
-The grid and the levels are shared across all roots. Two grid cells pointing to the same root index share all geometry and material data. The DAG deduplication means a brick arch appearing 10,000 times in a scene stores one geometry subtree.
+The grid and levels are shared across all chunks. Each chunk owns its own material palette (LUT). Two grid cells pointing to the same chunk index share all tree and material data.
 
 ---
 
-## Geometry DAG
+## Sparse Voxel 64-tree
 
-The DAG deduplicates on occupancy only. Two nodes with the same 64-bit occupancy pattern share a node regardless of what materials sit underneath them. This gives maximum geometric compression at the cost of needing a separate material storage mechanism.
+Each tree node covers a 4x4x4 block of children (64 slots). The `child_mask` field (u64) tracks which slots are occupied. Only occupied children are stored.
 
 Each level is SoA:
 
-- `occupancy: Vec<u64>` -- one bit per child slot. A 1 bit means a child exists there.
-- `voxel_count: Vec<u32>` -- count of MaterialsArray entries contributed by this subtree. Uniform subtrees (LEAF_FLAG set) contribute 0.
-- `children_start: Vec<u32>` -- where this node's children begin in the flat children array.
+- `child_mask: Vec<u64>` -- one bit per child slot. A 1 bit means a child exists there.
+- `child_start: Vec<u32>` -- where this node's children begin in the flat children array.
+- `rep_material: Vec<u32>` -- per-chunk LUT index, blended bottom-up from children. Used for LOD early termination.
 - `children: BitpackedArray` -- packed child entries, bitpacked at the minimum width for the pool size.
 
-Only occupied children are stored. `occupancy[i].count_ones()` gives the child count for node `i`.
+A child entry is either:
+- `LEAF_FLAG | lut_index`: uniform subtree, all voxels have material `lut_index`. Traversal terminates here.
+- A node pointer into the next level's pool.
 
-SoA layout matters for GPU traversal. A warp of 32 threads reading `occupancy` for 32 different nodes touches one contiguous memory region. AoS would scatter those reads, causing cache misses on every field.
+Only occupied children are stored. `child_mask[i].count_ones()` gives the child count for node `i`.
+
+SoA layout matters for GPU traversal. A warp of 32 threads reading `child_mask` for 32 different nodes touches one contiguous memory region. AoS would scatter those reads.
 
 ---
 
-## Material data: Dolonius method
+## Material data
 
-Material data is stored in a flat 1D array (the **MaterialsArray**) per root, in Dolonius DFS order. During traversal, the ray maintains a running integer offset. At each descent step, the `voxel_count` of skipped sibling subtrees is added to the offset. When a leaf is hit, the offset points directly into the MaterialsArray.
+Materials are stored inline with the tree. Each node has a `rep_material` field: a per-chunk LUT index representing the blended material of its subtree. This is computed bottom-up at pack time and stored on disk as part of each Level chunk.
 
-This means geometry nodes carry no material payload at all. The DAG stays tight. The material lookup is one array read after traversal finishes.
+Uniform subtrees (LEAF_FLAG set) contribute no children and terminate traversal immediately. A 64^3 region of solid stone costs one child entry in the parent node.
 
-Uniform subtrees (LEAF_FLAG set) don't contribute to the MaterialsArray and don't advance the running offset. A 64^3 region of solid stone costs 0 entries in the MaterialsArray.
+### Per-chunk LUT
 
-### MaterialsArray
-
-Each root owns a `MaterialsArray`:
+Each chunk owns a `Lut`:
 
 ```
-MaterialsArray
-  lut: Vec<Voxel>          unique voxels referenced by this root's subtree
-  indices: BitpackedArray   one lut index per leaf in Dolonius DFS order
+Lut
+  values: Vec<Voxel>   unique voxels referenced by this chunk's subtree
 ```
 
-The bit width of `indices` is determined by the LUT size. A root with 16 unique voxels uses 4-bit indices. On disk, `lut` and `indices` are stored together in each root's chunk. The bit width is read from `indices.bits` at load time.
-
-This is where all the palette-style compression happens. There's no separate color palette struct in the Lattice itself. Each root's MaterialsArray has its own LUT of unique `Voxel` values, and the `indices` array references into that LUT with the narrowest bit width that fits. A root with only 4 unique voxels uses 2-bit indices. One with 200 uses 8-bit. The compression is local to each root.
+The bit width of child LUT indices is determined by the LUT size. A chunk with 16 unique voxels uses 4-bit index fields. One with 200 uses 8-bit. Compression is local to each chunk.
 
 ---
 
@@ -109,33 +108,33 @@ Voxel (32 bits):
 
 During glTF import, surface samples need to be mapped to discrete voxel colors. The importer uses a precomputed 256-entry color palette spread uniformly across OKLab space via sample elimination. Each sampled surface point is snapped to the nearest palette entry before it ever enters the Lattice.
 
-This palette only exists during import. It's not part of the Lattice structure. By the time voxels reach the packer, their RGB values are already set. The MaterialsArray LUT per root then further deduplicates on full 32-bit Voxel values (color + roughness + flags), so two voxels with the same palette color but different roughness are still distinct LUT entries.
+This palette only exists during import. It's not part of the Lattice structure. By the time voxels reach the packer, their RGB values are already set. The per-chunk LUT then further deduplicates on full 32-bit Voxel values (color + roughness + flags), so two voxels with the same palette color but different roughness are still distinct LUT entries.
 
-With 256 palette colors and 16 roughness levels plus material flags, a scene ends up with at most a few thousand unique voxels per root. This keeps MaterialsArray LUT sizes small and index bit widths narrow.
+With 256 palette colors and 16 roughness levels plus material flags, a scene ends up with at most a few thousand unique voxels per chunk. This keeps LUT sizes small and index bit widths narrow.
 
 ---
 
 ## Import chunking
 
-At dag_depth=8, each root is 4^8 = 65,536 voxels per side. Materializing all voxels for even a moderately dense scene before packing would exhaust RAM. Instead, the importer works in two phases.
+At depth=8, each chunk covers 4^8 = 65,536 voxels per side. Materializing all voxels for even a moderately dense scene before packing would exhaust RAM. Instead, the importer works in two phases.
 
-**Phase 1 — triangle binning.** One pass over all meshes builds a flat `Vec<Triangle>` and a bin map from chunk grid coordinates to triangle indices. Each triangle goes into every chunk whose AABB it overlaps. The flat triangle list stays in RAM throughout import; it's the smallest representation of the scene geometry.
+**Phase 1 -- triangle binning.** One pass over all meshes builds a flat `Vec<Triangle>` and a bin map from chunk grid coordinates to triangle indices. Each triangle goes into every chunk whose AABB it overlaps. The flat triangle list stays in RAM throughout import; it's the smallest representation of the scene geometry.
 
-**Phase 2 — per-chunk voxelization.** For each occupied chunk cell, in Morton order: clip triangles to the chunk AABB, voxelize, sort the resulting `VoxelSample`s in Morton order, and emit the sorted run. The run is handed directly to the packer via callback, then dropped. Only one chunk's samples are in memory at a time.
+**Phase 2 -- per-chunk voxelization.** For each occupied chunk cell, in Morton order: clip triangles to the chunk AABB, voxelize, sort the resulting `VoxelSample`s in Morton order, and emit the sorted run. The run is handed directly to the packer via callback, then dropped. Only one chunk's samples are in memory at a time.
 
-The chunk size (`ImportConfig::chunk_size`, voxels per side, must be a power of 4) is independent of `dag_depth`. It's purely a memory budget knob and has no effect on the output. Chunk boundaries are power-of-4 aligned in voxel space so Morton codes are contiguous within each run.
+The chunk size (`ImportConfig::chunk_size`, voxels per side, must be a power of 4) is independent of `depth`. It's purely a memory budget knob and has no effect on the output. Chunk boundaries are power-of-4 aligned in voxel space so Morton codes are contiguous within each run.
 
-The packer's k-way merge in `sort.rs` stitches the per-chunk sorted runs back into a globally ordered stream. This is load-bearing, not optional: for large roots a single in-memory sort of all voxels isn't feasible.
+The packer's k-way merge in `sort.rs` stitches the per-chunk sorted runs back into a globally ordered stream.
 
 ---
 
 ## Grid
 
-The grid is a flat 3D array of child entries. Its dimensions are determined at build time. When importing a glTF scene, the importer computes the axis-aligned bounding box of the entire scene in voxel space, then sizes the grid to cover that volume exactly. During construction, cells are inserted into a staging HashMap, and `GridLevel::finalize()` packs everything into a flat BitpackedArray using the known dimensions.
+The grid is a flat 3D array of child entries. Its dimensions are determined at build time. When importing a glTF scene, the importer computes the axis-aligned bounding box of the entire scene in voxel space, then sizes the grid to cover that volume exactly.
 
 Each grid entry is either:
-- A root index (clear LEAF_FLAG): real sub-DAG, data resident in VRAM
-- `LEAF_FLAG | root_index` (LEAF_FLAG set): proxy, only rep_voxel metadata in VRAM
+- A chunk index (clear LEAF_FLAG): real sub-tree, data resident in VRAM
+- `LEAF_FLAG | chunk_index` (LEAF_FLAG set): proxy, only rep_material metadata in VRAM
 
 ---
 
@@ -143,24 +142,22 @@ Each grid entry is either:
 
 Disk->RAM and RAM->VRAM are separate concerns with different granularities.
 
-**Disk->RAM:** full roots always. The streaming manager reads entire roots from disk into RAM ahead of time. Disk reads are slow and infrequent. They happen far enough in advance that they're never on the critical path.
+**Disk->RAM:** full chunks always. The streaming manager reads entire chunks from disk into RAM ahead of time. Disk reads are slow and infrequent. They happen far enough in advance that they're never on the critical path.
 
-**RAM->VRAM:** partial-depth uploads based on camera distance. RAM always holds the full tree for every loaded root. VRAM gets however many levels are needed given the camera's distance. LOD kicks in when a voxel at the current depth would subtend less than one pixel.
+**RAM->VRAM:** partial-depth uploads based on camera distance. RAM always holds the full tree for every loaded chunk. VRAM gets however many levels are needed given the camera's distance. LOD kicks in when a voxel at the current depth would subtend less than one pixel.
 
-At load time, `GeometryDagRoot::compute_rep_voxels()` does one bottom-up pass over the geometry tree using the MaterialsArray to compute a blended representative `Voxel` for every node in DFS order. This takes microseconds and produces a `rep_voxels: Vec<Voxel>` array stored in RAM. Nothing extra goes on disk.
-
-When uploading a root at depth N < dag_depth, nodes at level N get `LEAF_FLAG | lut_index` child entries instead of real pointers, where `lut_index` references the root's MaterialsArray LUT. The GPU traversal hits LEAF_FLAG, reads the rep voxel, and terminates. The transition from depth N to depth N+1 is a VRAM upload of one more level plus a rewrite of the leaf entries above it.
+When uploading a chunk at depth N < depth, nodes at level N get `LEAF_FLAG | rep_material_lut_index` child entries instead of real pointers. The GPU traversal hits LEAF_FLAG, reads the rep material from the root's LUT, and terminates. The transition from depth N to depth N+1 is a VRAM upload of one more level plus a rewrite of the leaf entries above it.
 
 The full lifecycle of a grid cell:
 
 ```
-not loaded:   LEAF_FLAG | root_index in grid, rep_voxel in metadata table only
-loading:      async disk read, compute_rep_voxels() on CPU
-resident:     real root_index in grid, full or partial tree in VRAM
-evicting:     write LEAF_FLAG | root_index back to grid, free VRAM regions
+not loaded:   LEAF_FLAG | chunk_index in grid, rep_material in metadata only
+loading:      async disk read into RAM
+resident:     real chunk_index in grid, full or partial tree in VRAM
+evicting:     write LEAF_FLAG | chunk_index back to grid, free VRAM regions
 ```
 
-When a root transitions from proxy to resident, the grid entry is written last, after all VRAM data is in place. The GPU never sees a partially-uploaded root.
+When a chunk transitions from proxy to resident, the grid entry is written last, after all VRAM data is in place. The GPU never sees a partially-uploaded chunk.
 
 ---
 
@@ -168,17 +165,15 @@ When a root transitions from proxy to resident, the grid entry is written last, 
 
 ### Finding the hit
 
-The ray traverses the tree level by level. At each node, the occupancy mask tells the shader which children exist. Empty children are skipped. When a child entry has LEAF_FLAG set, the shader returns immediately with the encoded voxel (either a rep voxel for LOD nodes or a materials array lookup for real leaves).
-
-The running Dolonius offset accumulates voxel_count of skipped siblings at each descent step. At a real leaf, the offset indexes into the MaterialsArray for the root.
+The ray traverses the tree level by level. At each node, the child_mask tells the shader which children exist. Empty children are skipped. When a child entry has LEAF_FLAG set, the shader returns immediately using rep_material (looked up in the chunk's LUT) for both LOD nodes and uniform leaf subtrees.
 
 ### Traversal optimizations
 
 **Fractional coordinate encoding.** The tree lives in [1.0, 2.0). IEEE floats in that range have exponent zero, so the mantissa encodes position as fixed-point. Extracting the cell index at any level is two bit operations with no multiply or divide.
 
-**Ancestor stack.** Caches parent node indices and Dolonius base offsets. When the ray steps to a neighbor, comparing old and new position bits identifies the highest level that changed. The stack has the right values ready. About 2x speedup over root-to-leaf descent.
+**Ancestor stack.** Caches parent node indices. When the ray steps to a neighbor, comparing old and new position bits identifies the highest level that changed. The stack has the right values ready. About 2x speedup over root-to-leaf descent.
 
-**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit occupancy mask. If so, the step size doubles. Adds about 21% more empty space skipped for free.
+**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit child_mask. If so, the step size doubles. Adds about 21% more empty space skipped for free.
 
 **Ray-octant mirroring.** The coordinate system is mirrored to the negative ray octant at traversal start. With all direction components negative, finding the exit face is just finding the minimum of three distances with no sign conditionals. About 10% faster.
 
@@ -198,13 +193,13 @@ L_new = (1 - alpha) * L_old + alpha * S
 
 ---
 
-## Disk format: PSVDAG
+## Disk format
 
 On disk, sub-node references are removed from the children arrays. Nodes are written depth-first. The first time a unique node appears it gets a label. Every subsequent reference to the same node is a back-reference to that label. LEAF_FLAG entries are written as-is since they're terminal values.
 
 The loader reconstructs explicit sub-node indices by walking the DFS stream. Loading is close to a direct copy.
 
-PSVDAG achieves 2.8-3.8x smaller files than pointer-based SVDAG.
+This encoding achieves 2.8-3.8x smaller files than pointer-based storage.
 
 ---
 
@@ -217,32 +212,28 @@ Header:
   flags:           u16
   world_min:       [i64; 3]    voxel-space coordinates
   world_max:       [i64; 3]
-  dag_depth:       u8
+  depth:           u8
   _pad:            [u8; 3]
-  root_count:      u32
   chunk_count:     u32
-  chunks:          [{tag: u32, offset: u64, size: u64}; chunk_count]
+  chunk_entry_count: u32
+  chunk_entries:   [{tag: u32, offset: u64, size: u64}; chunk_entry_count]
 ```
 
 Chunks:
 
 ```
-LVL*    one chunk per DAG level (* = level index, 0 = root level)
+LVL*    one chunk per SVO level (* = level index, 0 = root level)
   node_count:       u32
-  occupancy:        [u64; node_count]
-  voxel_count:      [u32; node_count]
-  children_start:   [u32; node_count]
-  children:         [u8; ...]           bitpacked at child_bits, PSVDAG DFS order
-  child_bits:       u8                  bit width for intra-level child pointers
+  child_mask:       [u64; node_count]
+  rep_material:     [u32; node_count]
+  child_start:      [u32; node_count]
+  children:         [u8; ...]           bitpacked, DFS order
+  child_bits:       u8
 
-ROOT*   one chunk per DAG root (* = root index)
+ROOT*   one chunk per root (* = chunk index)
   root_node_index:  u32
-  leaf_start:       u32                 logical entry index into bottom level children
   lut_count:        u32
-  lut_entries:      [u32; lut_count]    raw Voxel values (the MaterialsArray LUT)
-  index_bits:       u8                  bit width for MaterialsArray indices
-  index_count:      u32
-  indices:          [u8; ...]           bitpacked MaterialsArray indices at index_bits
+  lut_entries:      [u32; lut_count]    raw Voxel values
 
 GRID    the spatial grid
   dims:             [u32; 3]
@@ -250,12 +241,10 @@ GRID    the spatial grid
   child_count:      u32
   children:         [u8; ...]           bitpacked grid entries at child_bits
 
-SPIX    spatial index: maps 3D positions to root indices for the streaming manager
+SPIX    spatial index: maps 3D positions to chunk indices for the streaming manager
   entry_count:      u32
-  entries:          [{pos: [i32; 3], root_index: u32}; entry_count]
+  entries:          [{pos: [i32; 3], chunk_index: u32}; entry_count]
 ```
-
-Note there's no palette chunk. The 256-color OKLab palette is only used during import to snap surface samples to discrete colors. By the time data hits the .lattice file, colors are baked into the Voxel values stored in each root's MaterialsArray LUT.
 
 ---
 
@@ -268,12 +257,12 @@ lattice/
   src/
     lattice/
       mod.rs          # Lattice, ChildIter
-      geometry_dag.rs # GeometryDagLevel (SoA), GeometryDagRoot (materials + rep_voxels)
-      grid.rs         # GridLevel (flat 3D array, auto-sized via staging HashMap)
+      svo.rs          # Level (SoA), Chunk (materials + root node index)
+      grid.rs         # Grid (flat 3D array, auto-sized)
       node.rs         # LEAF_FLAG and child entry helpers
       voxel.rs        # Voxel (repr(transparent) u32 newtype)
-      bitpacked.rs    # BitpackedArray, fixed-width packed storage, Hash
-      lut.rs          # Lut, MaterialsArray (LUT + bitpacked indices, owned per root)
+      bitpacked.rs    # BitpackedArray, fixed-width packed storage
+      lut.rs          # Lut, per-chunk palette
 
     import/
       mod.rs          # importer entry point, ImportConfig, VoxelSample
@@ -287,15 +276,14 @@ lattice/
     pack/
       mod.rs          # packing entry point, PackConfig
       sort.rs         # k-way merge of per-chunk sorted runs into Morton-ordered stream
-      dag.rs          # bottom-up streaming DAG construction
-      lut.rs          # pool-size bitpacking after construction
-      materials.rs    # Dolonius materials array construction
-      serialize.rs    # .lattice file writing, PSVDAG encoding
+      tree.rs         # bottom-up streaming SVO construction
+      repack.rs       # pool-size bitpacking after construction
+      serialize.rs    # .lattice file writing, DFS encoding
 
     load/
-      mod.rs          # load_lattice (disk->RAM), upload_root (RAM->VRAM at given depth)
+      mod.rs          # load_lattice (disk->RAM), upload_chunk (RAM->VRAM at given depth)
       header.rs       # .lattice header parsing
-      stream.rs       # PSVDAG DFS stream decoding, node index reconstruction
+      stream.rs       # DFS stream decoding, node index reconstruction
       upload.rs       # GPU buffer management, GpuLattice
 
     render/
@@ -308,7 +296,7 @@ lattice/
 
   shaders/
     common.wgsl       # shared math, type definitions, bitpacked decode helpers
-    traverse.wgsl     # 64-tree DDA, Dolonius offset accumulation, LOD early termination
+    traverse.wgsl     # 64-tree DDA, LOD early termination
     primary.wgsl      # primary ray dispatch, one thread per pixel
     gi.wgsl           # path tracing bounce loop, BRDF sampling, emissive injection
     accumulate.wgsl   # per-face weighted GI accumulation into the lighting buffer
@@ -324,15 +312,12 @@ lattice/
 
 ## Key findings from research
 
-- A 64-tree produces 37% fewer total nodes than an octree on the same scene and traverses faster, especially with the 64-bit occupancy mask enabling sub-block coalescing.
-- Geometry-only DAG deduplication with the Dolonius attribute method adds about 1% to DAG size compared to a pure geometry DAG. Per-pointer methods (Dado et al.) roughly double DAG size.
-- Leaf-level deduplication is where almost all savings happen. At the 4^3 level, 77% of nodes are duplicates. At the 64^3 level, 0.1%.
+- A 64-tree produces 37% fewer total nodes than an octree on the same scene and traverses faster, especially with the 64-bit child_mask enabling sub-block coalescing.
 - The ancestor stack is the highest-impact traversal optimization (~2x). Sub-block coalescing adds ~21%, ray-octant mirroring adds ~10%.
-- PSVDAG-style encoding achieves 2.8-3.8x smaller files than pointer-based SVDAG.
-- Geometry DAG traversal runs from GPU L2 cache on typical scenes. Material-inline approaches push the node pool into VRAM bandwidth. For path tracing where traversal runs hundreds of times per pixel, this is a 3-8x practical difference.
-- Per-root MaterialsArrays mean LUT sizes reflect per-root voxel variety, not global variety. A root with 16 unique voxels uses 4-bit indices regardless of what the rest of the scene looks like.
-- LOD via rep_voxels costs no disk space. The rep_voxel array is computed in microseconds at load time from the MaterialsArray. The GPU sees LEAF_FLAG entries at the truncation depth and returns immediately. The traversal algorithm is unchanged.
-- Streaming keeps disk->RAM and RAM->VRAM separate. RAM holds full roots, always. VRAM holds partial-depth roots based on camera distance. Disk reads are infrequent and off the critical path.
+- DFS stream encoding achieves 2.8-3.8x smaller files than pointer-based storage.
+- Per-chunk LUTs mean index bit widths reflect per-chunk voxel variety, not global variety. A chunk with 16 unique voxels uses 4-bit indices regardless of what the rest of the scene looks like.
+- Inline rep_material per node gives LOD with no runtime cost. The GPU hits LEAF_FLAG, reads rep_material, looks up the chunk LUT, done. No separate rep_voxel array needed at load time.
+- Streaming keeps disk->RAM and RAM->VRAM separate. RAM holds full chunks, always. VRAM holds partial-depth chunks based on camera distance. Disk reads are infrequent and off the critical path.
 
 ---
 

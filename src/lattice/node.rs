@@ -1,8 +1,6 @@
-// High bit of a u32 child entry. When set, the lower bits are a leaf value.
+// High bit of a u32 child entry. When set, the lower bits are a LUT index
+// into the chunk's palette (uniform subtree or LOD terminal node).
 // When clear, the lower bits are a pointer into the next level's node pool.
-//
-// For Material DAG leaves, a leaf value is a per-section-root LUT index.
-// For Geometry DAG levels, a leaf value marks a uniform subtree.
 pub const LEAF_FLAG: u32 = 1 << 31;
 
 pub fn is_leaf(child: u32) -> bool {

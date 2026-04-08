@@ -22,7 +22,7 @@ fn main() -> Result<(), anyhow::Error> {
 	};
 
 	let pack_config = PackConfig {
-		dag_depth: 3,
+		depth: 3,
 		world_min: import_config.world_min,
 		world_max: import_config.world_max,
 	};
