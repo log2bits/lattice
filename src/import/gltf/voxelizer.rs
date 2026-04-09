@@ -15,14 +15,7 @@ pub fn sample_texture(pixels: &[[u8; 3]], width: u32, uv: [f32; 2]) -> [u8; 3] {
 
 // Iterates over all voxels in the triangle's AABB within [vmin, vmax), tests each
 // with triangle_voxel_intersect, samples the material, and appends VoxelSamples.
-pub fn voxelize_triangle(
-	tri: &Triangle,
-	mat: &PreparedMaterial,
-	palette: &mut Palette,
-	voxel_size: f64,
-	vmin: [i64; 3],
-	vmax: [i64; 3],
-	out: &mut Vec<VoxelSample>,
-) {
+pub fn voxelize_triangle(tri: &Triangle, mat: &PreparedMaterial, palette: &mut Palette, voxel_size: f64, vmin: [i64; 3], vmax: [i64; 3], out: &mut Vec<VoxelSample>) {
+	println!("voxelizing triangle");
 	todo!()
 }

@@ -11,6 +11,101 @@ use crate::pack::sort::morton_encode;
 use std::collections::HashMap;
 use std::path::Path;
 
+// Computes the scene AABB in voxel-space by walking the scene graph and applying
+// node transforms to each primitive's bounding box corners.
+// Returns (world_min, world_max) as integer voxel coordinates.
+pub fn gltf_scene_bounds(path: &Path, voxel_size: f64) -> Result<([i64; 3], [i64; 3]), anyhow::Error> {
+	let (document, _buffers, _images) = gltf::import(path)?;
+
+	let mut scene_min = [f32::MAX; 3];
+	let mut scene_max = [f32::MIN; 3];
+
+	// Walk every scene root, accumulating the transform down the node tree.
+	let identity = [
+		[1.0f32, 0.0, 0.0, 0.0],
+		[0.0, 1.0, 0.0, 0.0],
+		[0.0, 0.0, 1.0, 0.0],
+		[0.0, 0.0, 0.0, 1.0],
+	];
+	for scene in document.scenes() {
+		for node in scene.nodes() {
+			visit_node(&node, &identity, &mut scene_min, &mut scene_max);
+		}
+	}
+
+	if scene_min[0] == f32::MAX {
+		return Ok(([0, 0, 0], [1, 1, 1]));
+	}
+
+	let world_min = [
+		(scene_min[0] as f64 / voxel_size).floor() as i64,
+		(scene_min[1] as f64 / voxel_size).floor() as i64,
+		(scene_min[2] as f64 / voxel_size).floor() as i64,
+	];
+	let world_max = [
+		(scene_max[0] as f64 / voxel_size).ceil() as i64,
+		(scene_max[1] as f64 / voxel_size).ceil() as i64,
+		(scene_max[2] as f64 / voxel_size).ceil() as i64,
+	];
+
+	Ok((world_min, world_max))
+}
+
+fn visit_node(
+	node: &gltf::Node,
+	parent_transform: &[[f32; 4]; 4],
+	scene_min: &mut [f32; 3],
+	scene_max: &mut [f32; 3],
+) {
+	let local = node.transform().matrix();
+	let transform = mat4_mul(parent_transform, &local);
+
+	if let Some(mesh) = node.mesh() {
+		for primitive in mesh.primitives() {
+			let bb = primitive.bounding_box();
+			// Transform all 8 corners of the local AABB into world space.
+			for &sx in &[bb.min[0], bb.max[0]] {
+				for &sy in &[bb.min[1], bb.max[1]] {
+					for &sz in &[bb.min[2], bb.max[2]] {
+						let w = mat4_transform_point(&transform, [sx, sy, sz]);
+						for i in 0..3 {
+							scene_min[i] = scene_min[i].min(w[i]);
+							scene_max[i] = scene_max[i].max(w[i]);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for child in node.children() {
+		visit_node(&child, &transform, scene_min, scene_max);
+	}
+}
+
+// gltf matrices are column-major: m[col][row]
+fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+	let mut out = [[0.0f32; 4]; 4];
+	for col in 0..4 {
+		for row in 0..4 {
+			for k in 0..4 {
+				out[col][row] += a[k][row] * b[col][k];
+			}
+		}
+	}
+	out
+}
+
+fn mat4_transform_point(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+	// m[col][row], p is extended to [x, y, z, 1]
+	let w = m[0][3] * p[0] + m[1][3] * p[1] + m[2][3] * p[2] + m[3][3];
+	[
+		(m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0]) / w,
+		(m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1]) / w,
+		(m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2]) / w,
+	]
+}
+
 // Loads a glTF scene and calls on_chunk for each voxelization chunk in Morton order.
 // Each chunk's samples are sorted in Morton order before the callback fires.
 // Chunks are emitted in Morton order, so the packer sees a globally ordered stream.

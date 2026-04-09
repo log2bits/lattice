@@ -26,7 +26,6 @@ Each stage is independent. The handoff between stages is a well-defined data str
 - The only configurable parameter is `depth`. Everything else is determined by it.
 - All domain counts and indices are `u32`. `usize` is only used at `Vec` indexing call sites.
 - Face normals are derived from the DDA exit face at traversal time. No per-voxel normals stored.
-- No editing during rendering. Data is built once and uploaded. Read-only at runtime.
 - The renderer is always full path tracing. No rasterization fallback.
 
 ---
