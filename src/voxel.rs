@@ -11,39 +11,42 @@
 pub struct Voxel(u32);
 
 impl Voxel {
-	pub fn from_rgb_flags(rgb: [u8; 3], roughness: u8, emissive: bool, metallic: bool, transparent: bool) -> Self {
-		todo!()
-	}
+  pub fn from_rgb_flags(rgb: [u8; 3], roughness: u8, emissive: bool, metallic: bool, transparent: bool) -> Self {
+    let r = (rgb[0] as u32) << 24;
+    let g = (rgb[1] as u32) << 16;
+    let b = (rgb[2] as u32) << 8;
+    let rough = ((roughness & 0xf) as u32) << 4;
+    let e = if emissive  { 1 << 3 } else { 0 };
+    let m = if metallic  { 1 << 2 } else { 0 };
+    let t = if transparent { 1 << 1 } else { 0 };
+    Voxel(r | g | b | rough | e | m | t)
+  }
 
-	pub fn rgb(self) -> [u8; 3] {
-		todo!()
-	}
+  pub fn rgb(self) -> [u8; 3] {
+    [(self.0 >> 24) as u8, (self.0 >> 16) as u8, (self.0 >> 8) as u8]
+  }
 
-	pub fn roughness(self) -> u8 {
-		todo!()
-	}
+  pub fn roughness(self) -> u8 {
+    ((self.0 >> 4) & 0xf) as u8
+  }
 
-	pub fn emissive(self) -> bool {
-		todo!()
-	}
+  pub fn emissive(self) -> bool {
+    (self.0 >> 3) & 1 != 0
+  }
 
-	pub fn metallic(self) -> bool {
-		todo!()
-	}
+  pub fn metallic(self) -> bool {
+    (self.0 >> 2) & 1 != 0
+  }
 
-	pub fn transparent(self) -> bool {
-		todo!()
-	}
+  pub fn transparent(self) -> bool {
+    (self.0 >> 1) & 1 != 0
+  }
 }
 
 impl From<u32> for Voxel {
-	fn from(v: u32) -> Self {
-		Voxel(v)
-	}
+  fn from(v: u32) -> Self { Voxel(v) }
 }
 
 impl From<Voxel> for u32 {
-	fn from(v: Voxel) -> Self {
-		v.0
-	}
+  fn from(v: Voxel) -> Self { v.0 }
 }

@@ -1,4 +1,4 @@
-use palette::{FromColor, IntoColor, Oklab, Oklch, Srgb};
+use lattice::import::palette::*;
 use rayon::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -13,70 +13,12 @@ const ALPHA: f32 = 1.5;
 const BLACK_IDX: u32 = 0x000000;
 const WHITE_IDX: u32 = 0xFFFFFF;
 
-// Colour helpers
-
-#[inline(always)]
-pub fn idx_to_rgb(idx: usize) -> [u8; 3] {
-	[(idx >> 16) as u8, (idx >> 8) as u8, idx as u8]
-}
-
-#[inline(always)]
-pub fn rgb_to_idx(rgb: [u8; 3]) -> usize {
-	((rgb[0] as usize) << 16) | ((rgb[1] as usize) << 8) | rgb[2] as usize
-}
-
 #[inline(always)]
 fn is_pinned(idx: u32) -> bool {
 	idx == BLACK_IDX || idx == WHITE_IDX
 }
 
-fn rgb_to_oklab(rgb: [u8; 3]) -> [f32; 3] {
-	let srgb = Srgb::new(rgb[0], rgb[1], rgb[2]).into_format::<f32>();
-	let lab: Oklab = srgb.into_color();
-	[lab.l, lab.a, lab.b]
-}
-
-fn oklab_to_srgb(lab: [f32; 3]) -> [u8; 3] {
-	let oklab = Oklab::new(lab[0], lab[1], lab[2]);
-	let srgb: Srgb<f32> = Srgb::from_color(oklab);
-	let r = (srgb.red * 255.0).round() as i32;
-	let g = (srgb.green * 255.0).round() as i32;
-	let b = (srgb.blue * 255.0).round() as i32;
-	if r >= 0 && r <= 255 && g >= 0 && g <= 255 && b >= 0 && b <= 255 {
-		return [r as u8, g as u8, b as u8];
-	}
-
-	let lch: Oklch = oklab.into_color();
-	let mut lo = 0.0f32;
-	let mut hi = lch.chroma;
-	for _ in 0..24 {
-		let mid = (lo + hi) / 2.0;
-		let s: Srgb<f32> = Srgb::from_color(Oklab::from_color(Oklch::new(lch.l, mid, lch.hue)));
-		if s.red >= 0.0 && s.red <= 1.0 && s.green >= 0.0 && s.green <= 1.0 && s.blue >= 0.0 && s.blue <= 1.0 {
-			lo = mid;
-		} else {
-			hi = mid;
-		}
-	}
-
-	let s: Srgb<f32> = Srgb::from_color(Oklab::from_color(Oklch::new(lch.l, lo, lch.hue)));
-	[
-		(s.red * 255.0).round().clamp(0.0, 255.0) as u8,
-		(s.green * 255.0).round().clamp(0.0, 255.0) as u8,
-		(s.blue * 255.0).round().clamp(0.0, 255.0) as u8,
-	]
-}
-
-#[inline(always)]
-fn dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
-	let dl = a[0] - b[0];
-	let da = a[1] - b[1];
-	let db = a[2] - b[2];
-	dl * dl + da * da + db * db
-}
-
 // Global LUT
-
 static LUT: std::sync::OnceLock<Vec<[f32; 3]>> = std::sync::OnceLock::new();
 
 #[inline(always)]

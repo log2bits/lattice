@@ -1,15 +1,6 @@
-use oklab::{Rgb, srgb_to_oklab};
+use lattice::import::palette::rgb_to_oklab;
 use rayon::prelude::*;
 use std::env;
-
-fn rgb_to_oklab(rgb: [u8; 3]) -> [f32; 3] {
-	let lab = srgb_to_oklab(Rgb {
-		r: rgb[0],
-		g: rgb[1],
-		b: rgb[2],
-	});
-	[lab.l, lab.a, lab.b]
-}
 
 #[inline(always)]
 fn dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {

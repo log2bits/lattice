@@ -1,8 +1,6 @@
 pub mod build;
 pub mod finalize;
 pub mod sort;
-
-#[cfg(feature = "import")]
 use crate::import::VoxelSample;
 
 pub struct PackConfig {

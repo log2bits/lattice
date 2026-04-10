@@ -67,7 +67,15 @@ impl Palette {
 }
 
 #[inline(always)]
-fn srgb_to_linear(v: u8) -> f32 {
+pub fn dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
+	let dl = a[0] - b[0];
+	let da = a[1] - b[1];
+	let db = a[2] - b[2];
+	dl * dl + da * da + db * db
+}
+
+#[inline(always)]
+pub fn srgb_to_linear(v: u8) -> f32 {
 	static TABLE: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
 		std::array::from_fn(|i| {
 			let v = i as f32 / 255.0;
@@ -77,7 +85,8 @@ fn srgb_to_linear(v: u8) -> f32 {
 	TABLE[v as usize]
 }
 
-fn linear_to_srgb(v: f32) -> u8 {
+#[inline(always)]
+pub fn linear_to_srgb(v: f32) -> u8 {
 	let v = if v <= 0.0031308 {
 		12.92 * v
 	} else {
@@ -86,6 +95,7 @@ fn linear_to_srgb(v: f32) -> u8 {
 	(v * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
 
+#[inline(always)]
 pub fn to_lms_cbrt(rgb: [u8; 3]) -> [f32; 3] {
 	let r = srgb_to_linear(rgb[0]);
 	let g = srgb_to_linear(rgb[1]);
@@ -99,6 +109,7 @@ pub fn to_lms_cbrt(rgb: [u8; 3]) -> [f32; 3] {
 
 // squared oklab distance as a quadratic form in LMS^(1/3).
 // coefficients are M^T M where M is the lms_cbrt -> oklab matrix.
+#[inline(always)]
 pub fn lms_dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
 	let dl = a[0] - b[0];
 	let dm = a[1] - b[1];
@@ -111,6 +122,7 @@ pub fn lms_dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
 	- 3.4610971558 * dm * ds
 }
 
+#[inline(always)]
 pub fn oklab_distance_sq(a: [u8; 3], b: [u8; 3]) -> f32 {
 	lms_dist_sq(to_lms_cbrt(a), to_lms_cbrt(b))
 }
@@ -148,6 +160,7 @@ pub fn rgb_to_oklab(rgb: [u8; 3]) -> [f32; 3] {
 	]
 }
 
+#[inline(always)]
 pub fn oklab_to_rgb(oklab: [f32; 3]) -> [u8; 3] {
 	let l_ = ( 0.2158037573f32).mul_add(oklab[2], ( 0.3963377774f32).mul_add(oklab[1], oklab[0]));
 	let m_ = (-0.0638541728f32).mul_add(oklab[2], (-0.1055613458f32).mul_add(oklab[1], oklab[0]));
@@ -160,4 +173,14 @@ pub fn oklab_to_rgb(oklab: [f32; 3]) -> [u8; 3] {
 		linear_to_srgb((-0.3413193965f32).mul_add(s, (-1.2684380046f32).mul_add(l, 2.6097574011 * m))),
 		linear_to_srgb(( 1.7076147010f32).mul_add(s, (-0.0041960863f32).mul_add(l, -0.7034186147 * m))),
 	]
+}
+
+#[inline(always)]
+pub fn idx_to_rgb(idx: usize) -> [u8; 3] {
+	[(idx >> 16) as u8, (idx >> 8) as u8, idx as u8]
+}
+
+#[inline(always)]
+pub fn rgb_to_idx(rgb: [u8; 3]) -> usize {
+	((rgb[0] as usize) << 16) | ((rgb[1] as usize) << 8) | rgb[2] as usize
 }

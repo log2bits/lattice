@@ -1,5 +1,7 @@
 pub mod read;
 pub mod write;
+#[cfg(feature = "import")]
+pub mod vox;
 
 pub const MAGIC: &[u8; 8] = b"LATTICE\0";
 pub const VERSION: u32 = 1;

@@ -8,27 +8,30 @@ path = "src/lib.rs"
 
 [features]
 default = []
-import = []
+import = ["dep:gltf", "dep:dot_vox"]
 
 [dependencies]
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
-glam = "0.29"
+dot_vox = { version = "5.2", optional = true }
+glam = "0.32"
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "KHR_materials_pbrSpecularGlossiness"], optional = true }
 image = "0.25"
+rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1"
 wgpu = "22"
 winit = "0.30"
 
-# import feature deps (kept unconditional so palette tools compile without --features import)
-gltf = "1"
-
-# palette generation tools
-oklab = "1.1.2"
-palette = "0.7.6"
-rand = { version = "0.8", features = ["small_rng"] }
-
 [[bin]]
 name = "pack"
+required-features = ["import"]
+
+[[bin]]
+name = "palettize"
+required-features = ["import"]
+
+[[bin]]
+name = "palette_gen"
 required-features = ["import"]
 
 [profile.release]
