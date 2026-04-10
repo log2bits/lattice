@@ -672,7 +672,7 @@ fn som_layout(labs: &[[f32; 3]]) -> Vec<usize> {
 }
 
 fn generate_hald_clut(palette_labs: &[[f32; 3]], palette_rgb: &[[u8; 3]]) {
-	const LEVEL: usize = 8;
+	const LEVEL: usize = 16;
 	const STEPS: usize = LEVEL * LEVEL;
 	const IMG_SIZE: usize = LEVEL * LEVEL * LEVEL;
 

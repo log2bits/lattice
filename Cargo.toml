@@ -6,19 +6,30 @@ edition = "2024"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+import = []
+
 [dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+image = "0.25"
+rayon = "1"
 wgpu = "22"
 winit = "0.30"
-gltf = "1"
-rayon = "1"
-anyhow = "1"
-png = "0.17"
-oklab = "1.1.2"
-image = "0.25.10"
-ndarray = "0.15"
-rand = { version = "0.8", features = ["small_rng"] }
-palette = "0.7.6"
 
+# import feature deps (kept unconditional so palette tools compile without --features import)
+gltf = "1"
+
+# palette generation tools
+oklab = "1.1.2"
+palette = "0.7.6"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[[bin]]
+name = "pack"
+required-features = ["import"]
 
 [profile.release]
 opt-level = 3

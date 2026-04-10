@@ -1,111 +1,82 @@
 # Lattice
 
-A voxel renderer with full path tracing. Lattice voxelizes a scene, compresses it into a sparse voxel 64-tree per chunk, and renders via GPU path tracing. The depth of the tree is the only configurable parameter. Everything else about the structure is fixed and uniform, which keeps GPU traversal simple and the file format clean.
+A voxel renderer with path tracing, built in Rust + WebGPU. Import a glTF scene, voxelize it into a grid of sparse 64-trees, and render it with GPU ray tracing in the browser.
+
+The offline tool converts glTF to a `.lattice` file. The viewer loads that file, uploads partial tree data to the GPU based on camera distance, and traces rays in a compute shader. Voxels can be edited at runtime (place emissive blocks, see the lighting change live) but edits aren't saved to disk. It's a tech demo, not a game engine.
+
+Compiles to native and WASM. Uses rayon for CPU parallelism, WebGPU/WGSL for rendering, and targets wasm_bindgen_rayon for threaded WASM builds.
+
+---
+
+# Optimizations
+
+### Importing from glTF
+
+1. 256-color palette spread across OKLab space via sample elimination, used only at import time
+2. 16MB precomputed LUT maps every sRGB triplet to the nearest palette entry in O(1)
+3. Scene is spatially partitioned into chunks before voxelization, so only overlapping triangles are sent to each chunk's voxelizer
+4. Chunks are independent and parallelize trivially across threads with rayon
+5. Fat voxelization guarantees 6-connected (watertight) surfaces
+6. Conservative wireframe rasterization catches thin triangles that the area rasterizer would miss due to aliasing
+7. Interior voxels (all 6 face-neighbors occupied and opaque) are culled after voxelization since they're never visible
+
+### Storage
+
+1. Each chunk is a sparse voxel 64-tree (not an octree), so nodes encode 64 children instead of 8, cutting per-voxel overhead to ~0.19 bytes vs ~0.57 for SVOs
+2. No DAG, so edits are O(depth) with no CoW, rehashing, or refcounting
+3. Each node stores a 64-bit `occupancy` mask and a 64-bit `solid_mask`, which tracks uniform subtrees that terminate traversal early
+4. Per-chunk `MaterialTable` deduplicates on the full 32-bit Voxel value (color + roughness + flags), not just color
+5. `node_children` and `leaf_materials` are stored in separate bitpacked arrays so leaf entries don't inflate pointer bit widths
+6. All bitpacked widths scale with their contents: a chunk with 16 unique materials uses 4-bit indices everywhere
+7. Every `NodePool` is SoA, so GPU warps reading the same field across many nodes hit contiguous memory
+8. `lod_material` per node stores a blended subtree material computed bottom-up, enabling LOD without separate LOD trees
+9. .lattice file stores each chunk's depths top-down (coarsest first) so partial reads can stop early
+
+### Rendering
+
+1. Partial tree upload: CPU sends only the top N `NodePool` depths per chunk to VRAM based on camera distance, so VRAM cost tracks visible detail, not scene size
+2. Upload depth is continuous (1, 2, 3, or 4 depths per chunk), not discrete LOD steps
+3. Traversal uses an ancestor stack caching parent node indices, so stepping into neighbor cells doesn't restart from the root
+4. Coarse occupancy check groups the 64-bit `occupancy` into 8 regions of 2x2x2, enabling 8-cell skips over empty space
+5. Coordinate flipping (`flip_mask`) maps all rays into the negative octant, halving the branch count in the DDA inner loop
+6. LOD cutoff: when a node has no uploaded children, the GPU reads `lod_material` and renders one colored cube instead of descending
+
+### Later (path tracing)
+
+1. Bidirectional: rays from camera and rays from light sources (sun, emissive voxels)
+2. Emissive voxels discovered by camera rays get added to the light list dynamically
+3. Per-face unique ID with lighting averaged across that face, doing spatial and temporal accumulation in one pass
+4. Averaging strength tied to roughness: mirror faces accumulate slowly, diffuse faces accumulate aggressively
+5. Faces not updated recently get evicted from the lighting buffer
 
 ---
 
 ## Pipeline
 
 ```
-[import]   scene -> triangle bins -> per-chunk sorted runs -> k-way merged VoxelSample stream
-[pack]     sorted VoxelSample stream -> Lattice (grid + levels + chunks) -> .lattice file
-[load]     .lattice file -> RAM (full chunks) -> VRAM (partial depth for LOD)
-[render]   GPU buffers -> path traced image
+gltf scene
+  -> triangle partitioning per chunk
+  -> per-chunk voxelization (parallel)
+  -> morton-sorted VoxelSample stream per chunk
+  -> bottom-up 64-tree construction
+  -> .lattice file on disk
+
+.lattice file
+  -> full Lattice in RAM
+  -> partial tree upload to VRAM (LOD)
+  -> GPU ray traversal
 ```
 
-Each stage is independent. The handoff between stages is a well-defined data structure, so you can test any stage in isolation or swap in a different importer.
+Import and packing happen offline in a native CLI tool. Loading, uploading, rendering, and editing happen at runtime in the viewer (native or WASM).
 
 ---
 
-## Design choices that are fixed
+## Voxel
 
-- One tree type: sparse voxel 64-tree (SVO). No DAG, no deduplication across chunks.
-- Materials are stored inline with the tree. Each node carries a representative material LUT index for LOD. Uniform subtrees store a single material and terminate early.
-- Every tree level uses SoA layout. No AoS.
-- The grid is a flat 3D array of chunk pointers. Its dimensions are computed at build time from the scene bounds.
-- The only configurable parameter is `depth`. Everything else is determined by it.
-- All domain counts and indices are `u32`. `usize` is only used at `Vec` indexing call sites.
-- Face normals are derived from the DDA exit face at traversal time. No per-voxel normals stored.
-- The renderer is always full path tracing. No rasterization fallback.
-
----
-
-## Structure
+Every voxel is a 32-bit value. The color is full 24-bit linear RGB, not palette-indexed. The palette only exists during glTF import to keep per-chunk material tables small. Other importers (procedural, .vox, etc.) can skip the palette and use arbitrary colors.
 
 ```
-Lattice
-  grid: Grid                   flat 3D array of chunk pointers
-  depth: u8                    number of SVO levels
-  levels: Vec<Level>           shared node pools, one per depth level
-  chunks: Vec<Chunk>           per-chunk material palette and root node index
-```
-
-The grid and levels are shared across all chunks. Each chunk owns its own material palette (LUT). Two grid cells pointing to the same chunk index share all tree and material data.
-
----
-
-## Sparse Voxel 64-tree
-
-Each tree node covers a 4x4x4 block of children (64 slots). The `child_mask` field (u64) tracks which slots are occupied. Only occupied children are stored.
-
-Each level is SoA:
-
-- `child_mask: Vec<u64>` -- one bit per child slot. A 1 bit means a child exists there.
-- `leaf_mask: Vec<u64>` -- which occupied children are uniform (leaf) entries vs node pointers.
-- `child_start: Vec<u32>` -- where this node's children begin in the two children arrays.
-- `rep_material: BitpackedArray` -- per-chunk LUT index per node, blended bottom-up from children. Bitpacked at `ceil(log2(lut_size))` bits. Used for LOD early termination.
-- `ptr_children: BitpackedArray` -- node pointer children, bitpacked at `ceil(log2(node_pool_size))` bits.
-- `lut_children: BitpackedArray` -- uniform subtree LUT indices, bitpacked at `ceil(log2(lut_size))` bits.
-
-A child entry is either:
-- `LEAF_FLAG | lut_index`: uniform subtree, all voxels have material `lut_index`. Traversal terminates here.
-- A node pointer into the next level's pool.
-
-Only occupied children are stored. `child_mask[i].count_ones()` gives the child count for node `i`.
-
-SoA layout matters for GPU traversal. A warp of 32 threads reading `child_mask` for 32 different nodes touches one contiguous memory region. AoS would scatter those reads.
-
----
-
-## Material data
-
-Materials are stored inline with the tree. Each node has a `rep_material` field: a per-chunk LUT index representing the blended material of its subtree. This is computed bottom-up at pack time and stored on disk as part of each Level chunk.
-
-Uniform subtrees (LEAF_FLAG set) contribute no children and terminate traversal immediately. A 64^3 region of solid stone costs one child entry in the parent node.
-
-### Per-chunk LUT
-
-Each chunk owns a `Lut`:
-
-```
-Lut
-  values: Vec<Voxel>   unique voxels referenced by this chunk's subtree
-```
-
-The bit width of child LUT indices is determined by the LUT size. A chunk with 16 unique voxels uses 4-bit index fields. One with 200 uses 8-bit. Compression is local to each chunk.
-
-### Bitpacking strategy
-
-Mixing node pointers and `LEAF_FLAG | lut_index` entries in the same array breaks compression. `LEAF_FLAG` is bit 31, so any entry with it set looks like a large number and forces the array to widen to 32 bits, regardless of LUT size.
-
-The fix is to never mix them. Each level's children split into two separate bitpacked arrays, selected by a `leaf_mask`:
-
-- `leaf_mask: u64` -- which occupied children are uniform (LEAF_FLAG) entries. Sits alongside `child_mask` in the SoA.
-- pointer children: bitpacked at `ceil(log2(node_pool_size))` bits. Width set once per level after construction.
-- leaf children: bitpacked at `ceil(log2(lut_size))` bits. Width set once per chunk.
-
-The deepest level has no node pointers at all, only leaf children, so it uses only the leaf array. `rep_material` is also just a LUT index and gets the same treatment: stored as a bitpacked array at `ceil(log2(lut_size))` bits per node rather than a flat `Vec<u32>`.
-
-The result is that palette compression applies everywhere LUT indices appear: leaf children at all levels, rep_material at all levels. A chunk with 16 unique voxels stores all of that data at 4 bits per entry.
-
----
-
-## Voxel format
-
-Every voxel in every scene uses the same 32-bit layout:
-
-```
-Voxel (32 bits):
+Voxel (u32, repr(transparent)):
 
   bits 31-8   rgb          24-bit linear RGB color
   bits  7-4   roughness    nibble, 0 = mirror, 15 = fully diffuse
@@ -115,325 +86,303 @@ Voxel (32 bits):
   bit   0     reserved
 ```
 
-`Voxel` is a `#[repr(transparent)]` newtype over `u32` with `From<u32>` and `From<Voxel>` impls for zero-cost conversion.
+Zero-cost conversion to/from `u32`.
 
 ---
 
-## Import-time color palette
+## Sparse Voxel 64-Tree
 
-During glTF import, surface samples need to be mapped to discrete voxel colors. The importer uses a precomputed 256-entry color palette spread uniformly across OKLab space via sample elimination. Each sampled surface point is snapped to the nearest palette entry before it ever enters the Lattice.
+Each chunk is a sparse tree where every node covers a 4x4x4 block of children (64 slots). Tree depth is configurable and determines chunk resolution: depth 4 gives 4^4 = 256 voxels per side, depth 3 gives 64, etc.
 
-This palette only exists during import. It's not part of the Lattice structure. By the time voxels reach the packer, their RGB values are already set. The per-chunk LUT then further deduplicates on full 32-bit Voxel values (color + roughness + flags), so two voxels with the same palette color but different roughness are still distinct LUT entries.
+No DAG. Every node is unique and owns its children. This keeps edits trivial: walk down, change a leaf, update `lod_material` on the way back up. No copy-on-write, no rehashing, no reference counting.
 
-With 256 palette colors and 16 roughness levels plus material flags, a scene ends up with at most a few thousand unique voxels per chunk. This keeps LUT sizes small and index bit widths narrow.
+### SoA layout
+
+Each tree depth is stored as a `NodePool`, which is a set of parallel arrays, one per field. A warp of 32 GPU threads reading `occupancy` for 32 different nodes hits one contiguous memory region. AoS would scatter those reads across cache lines.
+
+Per `NodePool`:
+
+| Array | Type | Description |
+|---|---|---|
+| `occupancy` | `Vec<u64>` | Which of 64 slots have something in them |
+| `solid_mask` | `Vec<u64>` | Which occupied children are uniform (whole subtree is one material, stop here) |
+| `children_offset` | `Vec<u32>` | Where this node's children begin in the two child arrays |
+| `lod_material` | `BitpackedArray` | Blended material index per node, used when LOD cuts traversal short |
+| `node_children` | `BitpackedArray` | Indices into the next depth's NodePool |
+| `leaf_materials` | `BitpackedArray` | MaterialTable indices for solid subtree children |
+
+A child is either an index into the next `NodePool` (descend further) or a `MaterialTable` index meaning the entire subtree is one material (stop traversing). `solid_mask` tells you which is which. `occupancy.count_ones()` gives the child count for a node.
+
+At the deepest level, every child is a voxel. There are no `node_children`, only `leaf_materials`. The `solid_mask` equals `occupancy` because there's nothing further to descend into.
+
+### Bitpacking
+
+`node_children` and `leaf_materials` live in separate arrays to avoid polluting each other's bit width. If they shared an array, any `SOLID_FLAG` entry would force widening to 32 bits.
+
+`node_children` is bitpacked at `ceil(log2(pool_size))` bits, set once per depth after construction. `leaf_materials` is bitpacked at `ceil(log2(table_size))` bits, set per chunk. A chunk with 16 unique voxels stores everything at 4 bits per entry. One with 200 uses 8 bits.
+
+### LOD material
+
+Every node stores a `lod_material`: the dominant material of its subtree, blended bottom-up at pack time. When the GPU hits a node whose children weren't uploaded (too far away for full detail), it reads `lod_material` and renders the node as a solid colored cube.
+
+This also appears at the bottom level for consistency, but there it's just the same as whatever the node's voxels average to. The real per-voxel data is in `leaf_materials`.
 
 ---
 
-## Import chunking
+## MaterialTable
 
-At depth=8, each chunk covers 4^8 = 65,536 voxels per side. Materializing all voxels for even a moderately dense scene before packing would exhaust RAM. Instead, the importer works in two phases.
+Each chunk has its own `MaterialTable` mapping indices to full 32-bit Voxel values. Two voxels with the same RGB but different roughness are distinct entries.
 
-**Phase 1 -- triangle binning.** One pass over all meshes builds a flat `Vec<Triangle>` and a bin map from chunk grid coordinates to triangle indices. Each triangle goes into every chunk whose AABB it overlaps. The flat triangle list stays in RAM throughout import; it's the smallest representation of the scene geometry.
-
-**Phase 2 -- per-chunk voxelization.** For each occupied chunk cell, in Morton order: clip triangles to the chunk AABB, voxelize, sort the resulting `VoxelSample`s in Morton order, and emit the sorted run. The run is handed directly to the packer via callback, then dropped. Only one chunk's samples are in memory at a time.
-
-The chunk size (`ImportConfig::chunk_size`, voxels per side, must be a power of 4) is independent of `depth`. It's purely a memory budget knob and has no effect on the output. Chunk boundaries are power-of-4 aligned in voxel space so Morton codes are contiguous within each run.
-
-The packer's k-way merge in `sort.rs` stitches the per-chunk sorted runs back into a globally ordered stream.
+The table is built during packing by collecting all unique Voxel values in the chunk's subtree. The bit width of all material index fields (`leaf_materials`, `lod_material`) scales with table size, so chunks with few unique materials compress better.
 
 ---
 
 ## Grid
 
-The grid is a flat 3D array of child entries. Its dimensions are determined at build time. When importing a glTF scene, the importer computes the axis-aligned bounding box of the entire scene in voxel space, then sizes the grid to cover that volume exactly.
+The world is a flat 3D grid of chunk entries. Dimensions are computed at import time from the scene's bounding box. Each entry is either a chunk index, a proxy (only `lod_material` metadata loaded, flagged with `PROXY_FLAG`), or empty.
 
-Each grid entry is either:
-- A chunk index (clear LEAF_FLAG): real sub-tree, data resident in VRAM
-- `LEAF_FLAG | chunk_index` (LEAF_FLAG set): proxy, only rep_material metadata in VRAM
+At depth 4, each chunk covers 256^3 voxels. At 10cm voxel size, that's a 25.6m cube per chunk. A 500m scene is roughly 20x20x20 chunks.
 
 ---
 
-## Streaming and LOD
+## LOD via Partial Upload
 
-Disk->RAM and RAM->VRAM are separate concerns with different granularities.
+The full Lattice lives in RAM. When uploading to VRAM, the CPU decides how many `NodePool` depths to send per chunk based on camera distance.
 
-**Disk->RAM:** full chunks always. The streaming manager reads entire chunks from disk into RAM ahead of time. Disk reads are slow and infrequent. They happen far enough in advance that they're never on the critical path.
+A nearby chunk gets all 4 depths (full detail). A far chunk gets 2 (the GPU traverses down, hits a node with no uploaded children, reads `lod_material`, renders a colored cube). A chunk at the horizon might get just depth 0 (the root node, one color for the whole 25.6m cube).
 
-**RAM->VRAM:** partial-depth uploads based on camera distance. RAM always holds the full tree for every loaded chunk. VRAM gets however many levels are needed given the camera's distance. LOD kicks in when a voxel at the current depth would subtend less than one pixel.
+This is continuous, not discrete LOD steps. You can send exactly 1, 2, 3, or 4 depths per chunk. VRAM cost scales with what's actually visible at usable detail, not total scene size.
 
-When uploading a chunk at depth N < depth, nodes at level N get `LEAF_FLAG | rep_material_lut_index` child entries instead of real pointers. The GPU traversal hits LEAF_FLAG, reads the rep material from the root's LUT, and terminates. The transition from depth N to depth N+1 is a VRAM upload of one more level plus a rewrite of the leaf entries above it.
+No separate LOD trees, no LOD construction pipeline, no extra disk storage. Just upload less of the same tree.
 
-The full lifecycle of a grid cell:
+### Upload strategy
 
-```
-not loaded:   LEAF_FLAG | chunk_index in grid, rep_material in metadata only
-loading:      async disk read into RAM
-resident:     real chunk_index in grid, full or partial tree in VRAM
-evicting:     write LEAF_FLAG | chunk_index back to grid, free VRAM regions
-```
-
-When a chunk transitions from proxy to resident, the grid entry is written last, after all VRAM data is in place. The GPU never sees a partially-uploaded chunk.
+Each frame the CPU walks the grid, computes a target upload depth per chunk based on distance and screen-space projected size, and diffs against what's currently in the GPU buffer. Changed chunks get re-uploaded. The GPU buffers are structured so each `NodePool` depth is contiguous and can be updated independently.
 
 ---
 
-## Traversal
+## Import
 
-### Finding the hit
+The importer turns a glTF scene into a stream of `VoxelSample`s (position + voxel value) per chunk.
 
-The ray traverses the tree level by level. At each node, the child_mask tells the shader which children exist. Empty children are skipped. When a child entry has LEAF_FLAG set, the shader returns immediately using rep_material (looked up in the chunk's LUT) for both LOD nodes and uniform leaf subtrees.
+### Color palette
 
-### Traversal optimizations
+A 256-entry color palette is spread across OKLab space via sample elimination. A 16MB lookup table maps every possible sRGB triplet to the nearest palette entry. This only exists during glTF import to keep chunk `MaterialTable`s small. The palette is not part of the Lattice or the file format.
 
-**Fractional coordinate encoding.** The tree lives in [1.0, 2.0). IEEE floats in that range have exponent zero, so the mantissa encodes position as fixed-point. Extracting the cell index at any level is two bit operations with no multiply or divide.
+### Triangle partitioning
 
-**Ancestor stack.** Caches parent node indices. When the ray steps to a neighbor, comparing old and new position bits identifies the highest level that changed. The stack has the right values ready. About 2x speedup over root-to-leaf descent.
+One pass over all meshes builds a flat triangle list and a partition map from chunk grid coordinates to triangle indices. Each triangle goes into every chunk whose AABB it overlaps.
 
-**2x2x2 sub-block coalescing.** Before stepping, the traversal checks whether the 2x2x2 sub-block containing the current cell is entirely empty in the 64-bit child_mask. If so, the step size doubles. Adds about 21% more empty space skipped for free.
+### Voxelization
 
-**Ray-octant mirroring.** The coordinate system is mirrored to the negative ray octant at traversal start. With all direction components negative, finding the exit face is just finding the minimum of three distances with no sign conditionals. About 10% faster.
+Per chunk, in parallel across threads: clip triangles to the chunk AABB, rasterize them using barycentric projection with fat voxelization (guarantees 6-connected surfaces for interior culling), sample texture colors, snap to palette, emit morton-sorted VoxelSample runs.
 
----
+Fat voxelization is important. Without it, thin shells have gaps, and the "all 6 neighbors occupied" interior culling check fails, wasting memory on invisible voxels.
 
-## Lighting
+The voxelization approach is adapted from voxquant. Project each triangle onto its dominant axis plane, iterate the 2D bounding box, solve for the depth coordinate via the plane equation, emit voxels. Conservative rasterization via wireframe ensures no gaps from aliasing on thin triangles.
 
-Lighting is full path tracing. Primary rays dispatch from the camera. On each hit, the shader reads the voxel payload, derives the face normal from the DDA exit face, samples the BRDF based on roughness and the metallic flag, and dispatches a secondary ray. Emissive voxels contribute light directly. Shadow rays come out of the path tracing loop naturally.
+### Interior culling
 
-Each voxel face stores a running weighted average of accumulated indirect light:
-
-```
-L_new = (1 - alpha) * L_old + alpha * S
-```
-
-`S` is the new path traced sample. `alpha` is tuned per surface type: small for diffuse (stable accumulation), larger for specular (faster response). No sample history buffers, no reservoirs. One color value per face.
+After voxelization, any voxel with all 6 face-neighbors occupied and opaque is culled. These voxels are never visible from any direction.
 
 ---
 
-## Disk format
+## Packing
 
-On disk, sub-node references are removed from the children arrays. Nodes are written depth-first. The first time a unique node appears it gets a label. Every subsequent reference to the same node is a back-reference to that label. LEAF_FLAG entries are written as-is since they're terminal values.
+The packer takes per-chunk VoxelSample streams and builds the Lattice.
 
-The loader reconstructs explicit sub-node indices by walking the DFS stream. Loading is close to a direct copy.
+### Morton sort
 
-This encoding achieves 2.8-3.8x smaller files than pointer-based storage.
+Each chunk's samples arrive sorted in morton order from the voxelizer. Chunks are independent so each stream is processed separately.
+
+### Bottom-up construction
+
+The tree is built bottom-up from sorted samples. Leaf nodes are created first, then parent nodes from groups of 64 children. Uniform subtrees (all children are the same material) collapse into a single `leaf_materials` entry in the parent, and the parent's `solid_mask` bit is set. `lod_material` is computed during this pass by blending children bottom-up.
+
+### Finalization
+
+After the tree is built, unique Voxel values are collected into the chunk's `MaterialTable`. All material index fields are bitpacked to their final width based on table size. `node_children` arrays are bitpacked based on pool size at each depth.
+
+### Serialization
+
+The finished Lattice is written to a `.lattice` file. Chunks are stored contiguously and independently so the format is trivially streamable later if needed. Each chunk's data is written top-down (coarsest depth first) so partial reads for LOD can stop early.
 
 ---
 
-## The .lattice file format
+## .lattice File Format
 
 ```
 Header:
-  magic:           [u8; 4]     "LTCE"
-  version:         u16
-  flags:           u16
-  world_min:       [i64; 3]    voxel-space coordinates
-  world_max:       [i64; 3]
-  depth:           u8
-  _pad:            [u8; 3]
-  chunk_count:     u32
-  chunk_entry_count: u32
-  chunk_entries:   [{tag: u32, offset: u64, size: u64}; chunk_entry_count]
+  magic             [u8; 8]     "LATTICE\0"
+  version           u32
+  depth             u8
+  grid_dims         [u32; 3]
+  chunk_count       u32
+  voxel_size_m      f32         meters per voxel (e.g. 0.1)
+
+Per chunk (chunk_count times):
+  table_size        u32
+  table_values      [Voxel; table_size]
+  per depth (top-down, coarsest first):
+    node_count      u32
+    occupancy       [u64; node_count]
+    solid_mask      [u64; node_count]
+    children_offset [u32; node_count]
+    lod_material    bitpacked (table bit width)
+    node_children   bitpacked (pool bit width)
+    leaf_materials  bitpacked (table bit width)
+
+Grid:
+  entries           [u32; grid_dims.x * grid_dims.y * grid_dims.z]
 ```
 
-Chunks:
-
-```
-LVL*    one chunk per SVO level (* = level index, 0 = root level)
-  node_count:         u32
-  child_mask:         [u64; node_count]
-  leaf_mask:          [u64; node_count]
-  child_start:        [u32; node_count]
-  rep_material:       [u8; ...]           bitpacked LUT indices at lut_bits
-  ptr_children:       [u8; ...]           bitpacked node pointers at ptr_bits
-  lut_children:       [u8; ...]           bitpacked LUT indices at lut_bits
-  ptr_bits:           u8                  bit width for node pointers
-  lut_bits:           u8                  bit width for LUT indices (ceil(log2(lut_size)))
-
-ROOT*   one chunk per root (* = chunk index)
-  root_node_index:  u32
-  lut_count:        u32
-  lut_entries:      [u32; lut_count]    raw Voxel values
-
-GRID    the spatial grid
-  dims:             [u32; 3]
-  child_bits:       u8
-  child_count:      u32
-  children:         [u8; ...]           bitpacked grid entries at child_bits
-
-SPIX    spatial index: maps 3D positions to chunk indices for the streaming manager
-  entry_count:      u32
-  entries:          [{pos: [i32; 3], chunk_index: u32}; entry_count]
-```
+Top-down per chunk means you can read just the first 1-2 depths for a far chunk and stop. No seeking.
 
 ---
 
-## Modules
+## Rendering
+
+GPU ray tracing in WebGPU compute shaders. One thread per pixel, each thread casts a ray through the scene.
+
+### V1: Primary rays only
+
+Cast one ray per pixel from the camera. Traverse the 64-tree using DDA with the ancestor stack trick from dubiousconst282's guide. When a leaf is hit, read the material and shade with direct sun lighting. When a node has no uploaded children (LOD cutoff), use `lod_material` and render as a solid cube.
+
+The ancestor stack caches parent node indices so stepping into neighbor cells doesn't require restarting from the root. The coarse occupancy check groups the 64-bit `occupancy` into 8 coarse 2x2x2 regions, letting the traversal skip over empty regions in 2^3 steps at once.
+
+### Later: Path tracing
+
+Bidirectional. Rays from the camera bounce off surfaces, rays from light sources (sun, emissive voxels) cast into the scene. Emissive voxels are discovered by camera rays and added to a light list.
+
+Every voxel face gets a unique ID. Lighting values are accumulated per-face across frames, doing spatial and temporal averaging. Mirror surfaces average less, diffuse surfaces average more. Faces that haven't been updated recently get evicted.
+
+### Debug overlays
+
+Normals, depth, LOD depth per chunk, traversal iteration heatmap, voxel grid lines. Toggled at runtime.
+
+---
+
+## Editing
+
+At runtime, the user can place and remove individual voxels. The main use case is dropping emissive voxels into the scene to watch the lighting change.
+
+An edit walks down the tree to the target leaf, modifies it (or inserts/removes a child), then walks back up updating `lod_material` along the path. If the edit adds a new unique voxel value, the chunk's `MaterialTable` is extended and affected bitpacked arrays are recomputed. The modified chunk data is re-uploaded to the GPU.
+
+O(depth) work per edit. No CoW, no DAG overhead.
+
+---
+
+## Module Structure
 
 ```
 lattice/
   Cargo.toml
 
   src/
-    lattice/
-      mod.rs          # Lattice, ChildIter
-      svo.rs          # Level (SoA), Chunk (materials + root node index)
-      grid.rs         # Grid (flat 3D array, auto-sized)
-      node.rs         # LEAF_FLAG and child entry helpers
-      voxel.rs        # Voxel (repr(transparent) u32 newtype)
-      bitpacked.rs    # BitpackedArray, fixed-width packed storage
-      lut.rs          # Lut, per-chunk palette
+    lib.rs                    crate root, feature flags, re-exports
 
-    import/
-      mod.rs          # importer entry point, ImportConfig, VoxelSample
-      color.rs        # 256-entry OKLab color palette, nearest-entry lookup (import only)
-      gltf/
-        mod.rs        # glTF scene loading: triangle binning + per-chunk voxelization
-        mesh.rs       # triangle extraction, Sutherland-Hodgman chunk clipping
-        material.rs   # PBR material -> Voxel mapping
-        voxelizer.rs  # SAT intersection test, texture sampling
+    voxel.rs                  Voxel newtype, bit layout, From<u32>, field accessors
+    bitpacked.rs              BitpackedArray: fixed-width packed storage, encode/decode
+    material_table.rs         MaterialTable: per-chunk unique Voxel values, index lookup
 
-    pack/
-      mod.rs          # packing entry point, PackConfig
-      sort.rs         # k-way merge of per-chunk sorted runs into Morton-ordered stream
-      tree.rs         # bottom-up streaming SVO construction
-      repack.rs       # pool-size bitpacking after construction
-      serialize.rs    # .lattice file writing, DFS encoding
+    tree/
+      mod.rs                  Lattice: grid + depth + node pools + chunks
+      pool.rs                 NodePool: SoA arrays (occupancy, solid_mask, children, etc.)
+      chunk.rs                Chunk: root node index + MaterialTable
+      grid.rs                 Grid: flat 3D array of chunk entries, AABB sizing
+      node.rs                 SOLID_FLAG, PROXY_FLAG, slot indexing, coarse occupancy
+      walk.rs                 walk down to a position, walk up updating lod_material
 
-    load/
-      mod.rs          # load_lattice (disk->RAM), upload_chunk (RAM->VRAM at given depth)
-      header.rs       # .lattice header parsing
-      stream.rs       # DFS stream decoding, node index reconstruction
-      upload.rs       # GPU buffer management, GpuLattice
+    import/                   cfg(feature = "import"), excluded from WASM builds
+      mod.rs                  ImportConfig, VoxelSample, import entry point
+      gltf.rs                 glTF loading, mesh extraction, scene bounds
+      partition.rs            triangle binning into chunk grid cells
+      voxelize.rs             triangle rasterization (barycentric projection, fat mode)
+      palette.rs              OKLab 256-color palette, sRGB -> index LUT
+      pbr.rs                  PBR material properties -> Voxel bit layout
+      cull.rs                 interior voxel removal (6-neighbor check)
+
+    pack/                     cfg(feature = "import")
+      mod.rs                  PackConfig, entry point
+      sort.rs                 morton ordering, per-chunk stream merge
+      build.rs                bottom-up tree construction, lod_material blending
+      finalize.rs             MaterialTable collection, bitpack width assignment
+
+    format/
+      mod.rs                  .lattice header struct, magic bytes, version
+      write.rs                Lattice -> .lattice file
+      read.rs                 .lattice file -> Lattice in RAM
 
     render/
-      mod.rs          # renderer entry point, pipeline setup
-      tracer.rs       # frame loop, compute pass dispatch, output presentation
-      camera.rs       # camera state, uniform buffer layout
-      traverse.rs     # traversal pipeline and bind group setup
-      gi.rs           # GI pipeline, per-face lighting buffer management
-      debug.rs        # debug overlay pipeline and mode uniforms
+      mod.rs                  Renderer: device/queue setup, frame loop
+      camera.rs               camera state, projection, mouse/key input
+      lod.rs                  per-chunk target depth selection based on distance
+      upload.rs               GPU buffer layout, partial NodePool upload, diff/update
+      pipeline.rs             compute pipeline creation, bind group layout
+      present.rs              output blit, tonemapping, swapchain management
+      debug.rs                debug overlay modes and uniforms
+
+    edit.rs                   place/remove voxels, tree walk, MaterialTable extension
 
   shaders/
-    common.wgsl       # shared math, type definitions, bitpacked decode helpers
-    traverse.wgsl     # 64-tree DDA, LOD early termination
-    primary.wgsl      # primary ray dispatch, one thread per pixel
-    gi.wgsl           # path tracing bounce loop, BRDF sampling, emissive injection
-    accumulate.wgsl   # per-face weighted GI accumulation into the lighting buffer
-    debug.wgsl        # debug overlays: normals, depth, voxel index, occupancy
+    types.wgsl                Voxel struct, node layout, bitpacked decode, grid lookup
+    traverse.wgsl             64-tree DDA, ancestor stack, coarse skip, LOD cutoff
+    primary.wgsl              primary ray compute shader, one thread per pixel
+    output.wgsl               fullscreen blit, basic tonemap
+    debug.wgsl                overlay shaders: normals, depth, LOD, heatmap
 
-  tools/
-    pack.rs           # CLI: scene -> .lattice
-    render.rs         # CLI: .lattice -> frames
-    inspect.rs        # CLI: print .lattice header and stats
+  src/bin/
+    pack.rs                   CLI: gltf -> .lattice
+    view.rs                   CLI: .lattice -> window (native) or canvas (wasm)
+    inspect.rs                CLI: print .lattice header and stats
 ```
-
----
-
-## Key findings from research
-
-- A 64-tree produces 37% fewer total nodes than an octree on the same scene and traverses faster, especially with the 64-bit child_mask enabling sub-block coalescing.
-- The ancestor stack is the highest-impact traversal optimization (~2x). Sub-block coalescing adds ~21%, ray-octant mirroring adds ~10%.
-- DFS stream encoding achieves 2.8-3.8x smaller files than pointer-based storage.
-- Per-chunk LUTs mean index bit widths reflect per-chunk voxel variety, not global variety. A chunk with 16 unique voxels uses 4-bit indices regardless of what the rest of the scene looks like.
-- Inline rep_material per node gives LOD with no runtime cost. The GPU hits LEAF_FLAG, reads rep_material, looks up the chunk LUT, done. No separate rep_voxel array needed at load time.
-- Streaming keeps disk->RAM and RAM->VRAM separate. RAM holds full chunks, always. VRAM holds partial-depth chunks based on camera distance. Disk reads are infrequent and off the critical path.
 
 ---
 
 ## Resources
 
-### YouTube Channels
+### Key References
+
+| Reference | Why it matters |
+|---|---|
+| [Guide to sparse 64-trees](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/) | The traversal algorithm. Ancestor stack, coarse occupancy, flipped coordinates. |
+| [Aokana (2505.02017)](https://arxiv.org/abs/2505.02017) | Chunked SVDAG with LOD streaming. Validates the shallow-tree-per-chunk approach. |
+| [Hybrid Voxel Formats (2410.14128)](https://arxiv.org/abs/2410.14128) | Systematic comparison of voxel storage formats and their tradeoffs. |
+| [High Resolution SVDAGs](https://icg.gwu.edu/sites/g/files/zaxdzs6126/files/downloads/highResolutionSparseVoxelDAGs.pdf) | Original SVDAG paper. Bottom-up DAG reduction, GPU traversal. |
+| [Efficient Sparse Voxel Octrees](https://www.researchgate.net/publication/47645140_Efficient_Sparse_Voxel_Octrees) | Laine & Karras. Foundation for SVO traversal and beam optimization. |
+| [Voxelis Bible](https://github.com/WildPixelGames/voxelis) | SVO-DAG deep dive: batching, CoW, SoA, LOD, hash consing. |
+| [Amanatides & Woo DDA](http://www.cse.yorku.ca/~amana/research/grid.pdf) | The DDA algorithm for voxel ray traversal. |
+| [Compressing color data for voxels (Dolonius 2017)](https://dl.acm.org/doi/10.1145/3023368.3023381) | DFS-order color arrays, block compression for SVDAG attributes. |
+
+### Channels
 
 | Channel | Focus |
-|---------|-------|
-| [Douglas Dwyer](https://www.youtube.com/@DouglasDwyer) | Octo voxel engine in Rust + WebGPU, path-traced GI |
-| [John Lin (Voxely)](https://www.youtube.com/@johnlin) | Path-traced voxel sandbox engine, RTX |
-| [Gabe Rundlett](https://www.youtube.com/@GabeRundlett) | Open-source C++ voxel engine with Daxa/Vulkan |
-| [Ethan Gore](https://www.youtube.com/@EthanGore) | Voxel engine dev, binary greedy meshing contributor |
-| [VoxelRifts](https://www.youtube.com/@VoxelRifts) | Programming explainer videos, voxel focus |
-| [SimonDev](https://www.youtube.com/@simondev758) | Accessible intro video on Radiance Cascades |
+|---|---|
+| [Douglas Dwyer](https://www.youtube.com/@DouglasDwyer) | Octo voxel engine, Rust + WebGPU, path-traced GI |
+| [John Lin (Voxely)](https://www.youtube.com/@johnlin) | Path-traced voxel sandbox, RTX |
+| [Gabe Rundlett](https://www.youtube.com/@GabeRundlett) | C++ voxel engine, Daxa/Vulkan |
+| [Ethan Gore](https://www.youtube.com/@EthanGore) | Voxel engine dev, binary greedy meshing |
+| [VoxelRifts](https://www.youtube.com/@VoxelRifts) | Voxel programming explainers |
+| [SimonDev](https://www.youtube.com/@simondev758) | Radiance Cascades intro |
 
-### Projects and Repos
+### Projects
 
 | Project | Description |
-|---------|-------------|
-| [Voxel Raymarching](github.com/jamescatania1/voxel-raymarching) | Voxel raymarching with Rust and WGPU |
-| [VoxelRT](https://github.com/dubiousconst282/VoxelRT) | Voxel rendering experiments: brickmap, Tree64, XBrickMap, MultiDDA benchmarks |
-| [HashDAG](https://github.com/Phyronnaz/HashDAG) | Official open-source implementation of the HashDAG paper (Careil et al. 2020) |
-| [Voxelis](https://github.com/WildPixelGames/voxelis) | Pure Rust SVO-DAG crate with batching, reference counting, Bevy/Godot bindings |
-| [Octo Engine](https://github.com/DouglasDwyer/octo-release) | Rust + WebGPU voxel engine with ray marching and path-traced GI |
-| [BrickMap](https://github.com/stijnherfst/BrickMap) | High performance realtime CUDA voxel path tracer using brickmaps |
-| [gvox_engine](https://github.com/GabeRundlett/gvox_engine) | Moddable cross-platform voxel engine in C++ with Daxa/Vulkan |
-| [gvox](https://github.com/GabeRundlett/gvox) | General voxel format translation library |
-| [VoxelHex](https://github.com/Ministry-of-Voxel-Affairs/VoxelHex) | Sparse VoxelBrick Tree with ray tracing support |
-| [tree64](https://github.com/expenses/tree64) | Rust sparse 64-tree with hashing, based on dubiousconst282's guide |
-| [binary-greedy-meshing](https://github.com/cgerikj/binary-greedy-meshing) | Fast bitwise voxel meshing |
+|---|---|
+| [voxquant](https://github.com/) | glTF voxelizer, source of rasterization algorithms |
+| [VoxelRT](https://github.com/dubiousconst282/VoxelRT) | Tree64, brickmap, XBrickMap benchmarks |
+| [Voxelis](https://github.com/WildPixelGames/voxelis) | Rust SVO-DAG with batching, CoW, LOD |
+| [Octo Engine](https://github.com/DouglasDwyer/octo-release) | Rust + WebGPU voxel engine |
+| [tree64](https://github.com/expenses/tree64) | Rust sparse 64-tree with hashing |
+| [HashDAG](https://github.com/Phyronnaz/HashDAG) | HashDAG reference implementation |
+| [gvox](https://github.com/GabeRundlett/gvox) | Voxel format translation library |
 
-### Blog Posts
+### More
 
 | Resource | Description |
-|----------|-------------|
-| [A guide to fast voxel ray tracing using sparse 64-trees](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/) | Comprehensive guide: 64-tree traversal, brickmap comparison, benchmarks |
-| [A Rundown on Brickmaps](https://uygarb.dev/posts/0003_brickmap_rundown/) | Clear explanation of the van Wingerden brickmap/brickgrid structure |
-| [The Perfect Voxel Engine](https://voxely.net/blog/the-perfect-voxel-engine/) | John Lin's vision post on voxel engine architecture |
-| [A Voxel Renderer for Learning C/C++](https://jacco.ompf2.com/2021/02/01/a-voxel-renderer-for-learning-c-c/) | Two-level grid renderer, solid color bricks, OpenCL, 1B rays/sec |
-| [Voxel raytracing](https://tenebryo.github.io/posts/2021-01-13-voxel-raymarching.html) | SVDAG path tracer writeup |
-| [Voxelisation Algorithms review](https://pmc.ncbi.nlm.nih.gov/articles/PMC8707769/) | Comprehensive survey of voxel data structures |
-| [Voxel.Wiki: Raytracing](https://voxel.wiki/wiki/raytracing/) | Community wiki curating voxel raycasting resources and papers |
-| [Amanatides & Woo DDA explainer](https://m4xc.dev/articles/amanatides-and-woo/) | Deep dive into the DDA algorithm with visuals |
-
-### ShaderToy
-
-| Shader | Description |
-|--------|-------------|
-| [Radiance Cascades 3D (surface-based)](https://www.shadertoy.com/view/X3XfRM) | Surface-based 3D RC, 5 cascades, cubemap storage |
-| [Radiance Cascades (volumetric voxel)](https://www.shadertoy.com/view/M3ycWt) | True volumetric 3D RC with voxel raycaster |
-| [Amanatides & Woo DDA (branchless)](https://www.shadertoy.com/view/XdtcRM) | Clean branchless 3D DDA implementation |
-
-### Papers
-
-#### Foundational Ray Traversal
-
-| Paper | Link |
-|-------|------|
-| A Fast Voxel Traversal Algorithm for Ray Tracing, Amanatides & Woo 1987 | [PDF](http://www.cse.yorku.ca/~amana/research/grid.pdf) |
-| Efficient Sparse Voxel Octrees, Laine & Karras 2010 | [ResearchGate](https://www.researchgate.net/publication/47645140_Efficient_Sparse_Voxel_Octrees) |
-| GigaVoxels: Ray-Guided Streaming for Efficient and Detailed Voxel Rendering, Crassin et al. 2009 | [INRIA](http://maverick.inria.fr/Publications/2009/CNLE09/) |
-| Real-time Ray Tracing and Editing of Large Voxel Scenes (Brickmap), van Wingerden 2015 | [Utrecht](https://studenttheses.uu.nl/handle/20.500.12932/20460) |
-
-#### SVDAG Family
-
-| Paper | Link |
-|-------|------|
-| Hybrid Voxel Formats for Efficient Ray Tracing | [ARXIV](https://arxiv.org/html/2410.14128v1) |
-| High Resolution Sparse Voxel DAGs, Kampe, Sintorn, Assarsson 2013 | [PDF](https://icg.gwu.edu/sites/g/files/zaxdzs6126/files/downloads/highResolutionSparseVoxelDAGs.pdf) |
-| SSVDAGs: Symmetry-aware Sparse Voxel DAGs, Villanueva, Marton, Gobbetti 2016 | [ACM](https://dl.acm.org/doi/10.1145/2856400.2856406) |
-| Interactively Modifying Compressed Sparse Voxel Representations (HashDAG), Careil, Billeter, Eisemann 2020 | [Wiley](https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.13916) |
-| Lossy Geometry Compression for High Resolution Voxel Scenes, van der Laan et al. 2020 | [ACM](https://dl.acm.org/doi/10.1145/3384543) |
-| Transform-Aware Sparse Voxel Directed Acyclic Graphs (TSVDAG), Molenaar & Eisemann 2025 | [ACM](https://dl.acm.org/doi/10.1145/3728301) |
-| Editing Compact Voxel Representations on the GPU, Molenaar & Eisemann 2024 | [TU Delft](https://publications.graphics.tudelft.nl/papers/13) |
-| Editing Compressed High-Resolution Voxel Scenes with Attributes, Molenaar & Eisemann 2023 | [Wiley](https://onlinelibrary.wiley.com/doi/full/10.1111/cgf.14757) |
-| PSVDAG: Compact Voxelized Representation of 3D Scenes Using Pointerless SVDAGs, Vokorokos, Mados, Bilanova 2020 | [Computing and Informatics](https://doi.org/10.31577/cai_2020_3_587) |
-| Evaluation of Pointerless SVO Encoding Schemes Using Huffman Encoding, Mados et al. 2020 | [IEEE](https://doi.org/10.1109/ICETA51985.2020.9379265) |
-
-#### Color and Attribute Compression
-
-| Paper | Link |
-|-------|------|
-| Geometry and Attribute Compression for Voxel Scenes (Dado), Dado et al. 2016 | [CGF](https://diglib.eg.org/handle/10.1111/cgf.12841) |
-| Compressing Color Data for Voxelized Surface Geometry (Dolonius), Dolonius et al. 2017 | [ACM I3D](https://dl.acm.org/doi/10.1145/3023368.3023381) |
-
-#### Surveys and Hybrid Formats
-
-| Paper | Link |
-|-------|------|
-| Hybrid Voxel Formats for Efficient Ray Tracing, 2024 | [arxiv](https://arxiv.org/abs/2410.14128) |
-| Aokana: A GPU-Driven Voxel Rendering Framework for Open World Games, 2025 | [arxiv](https://arxiv.org/abs/2505.02017) |
-| Voxelisation Algorithms and Data Structures: A Review, PMC 2021 | [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC8707769/) |
-
-### Misc
-
-| Resource | Description |
-|----------|-------------|
-| [Voxel.Wiki](https://voxel.wiki) | Community wiki, good starting hub for voxel rendering resources |
-| [Voxely.net blog](https://voxely.net/blog/) | John Lin's blog on voxel engine design |
-| [Jacco's voxel blog series](https://jacco.ompf2.com) | Practical renderer tutorials with OpenCL |
+|---|---|
+| [Voxel.Wiki](https://voxel.wiki) | Community hub for voxel rendering resources |
+| [Voxely.net blog](https://voxely.net/blog/) | John Lin's voxel engine design posts |
+| [A Rundown on Brickmaps](https://uygarb.dev/posts/0003_brickmap_rundown/) | Brickmap/brickgrid explanation |
+| [Radiance Cascades 3D (ShaderToy)](https://www.shadertoy.com/view/X3XfRM) | Surface-based 3D radiance cascades |
+| [Branchless DDA (ShaderToy)](https://www.shadertoy.com/view/XdtcRM) | Clean branchless 3D DDA reference |

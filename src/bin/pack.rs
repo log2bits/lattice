@@ -1,29 +1,42 @@
+use lattice::format::write::write_lattice;
+use lattice::import::gltf::scene_bounds;
 use lattice::import::ImportConfig;
-use lattice::import::gltf::{gltf_scene_bounds, import_gltf};
-use lattice::pack::{PackConfig, pack};
+use lattice::pack::{pack, PackConfig};
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::PathBuf;
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> anyhow::Result<()> {
 	let args: Vec<String> = std::env::args().collect();
 
 	let mut input_arg: Option<&str> = None;
 	let mut output_arg: Option<&str> = None;
-	let mut voxels_per_meter: f64 = 16.0;
+	let mut depth: u8 = 4;
+	let mut voxel_size: f32 = 0.1;
 
 	let mut i = 1;
 	while i < args.len() {
 		match args[i].as_str() {
-			"--voxels-per-meter" => {
+			"--depth" => {
 				i += 1;
-				voxels_per_meter = args.get(i)
+				depth = args.get(i)
 					.and_then(|s| s.parse().ok())
-					.ok_or_else(|| anyhow::anyhow!("--voxels-per-meter requires a positive number"))?;
+					.ok_or_else(|| anyhow::anyhow!("--depth requires an integer"))?;
 			}
-			arg if !arg.starts_with("--") && input_arg.is_none() => input_arg = Some(arg),
-			arg if !arg.starts_with("--") && output_arg.is_none() => output_arg = Some(arg),
+			"--voxel-size" => {
+				i += 1;
+				voxel_size = args.get(i)
+					.and_then(|s| s.parse().ok())
+					.ok_or_else(|| anyhow::anyhow!("--voxel-size requires a float"))?;
+			}
+			"-o" => {
+				i += 1;
+				output_arg = args.get(i).map(|s| s.as_str());
+			}
+			arg if !arg.starts_with('-') && input_arg.is_none() => input_arg = Some(arg),
 			arg => {
-				eprintln!("unknown argument: {}", arg);
-				eprintln!("usage: pack <scene.gltf> <out.lattice> [--voxels-per-meter <n>]");
+				eprintln!("unknown argument: {arg}");
+				eprintln!("usage: pack <scene.gltf> -o <out.lattice> [--depth <n>] [--voxel-size <m>]");
 				std::process::exit(1);
 			}
 		}
@@ -31,34 +44,30 @@ fn main() -> Result<(), anyhow::Error> {
 	}
 
 	let (Some(input_arg), Some(output_arg)) = (input_arg, output_arg) else {
-		eprintln!("usage: pack <scene.gltf> <out.lattice> [--voxels-per-meter <n>]");
+		eprintln!("usage: pack <scene.gltf> -o <out.lattice> [--depth <n>] [--voxel-size <m>]");
 		std::process::exit(1);
 	};
 
 	let input = PathBuf::from(input_arg);
 	let output = PathBuf::from(output_arg);
 
-	let voxel_size = 1.0 / voxels_per_meter;
-	let (world_min, world_max) = gltf_scene_bounds(&input, voxel_size)?;
-	eprintln!("scene bounds: {:?} to {:?} (voxels)", world_min, world_max);
+	let (world_min, world_max) = scene_bounds(&input)?;
+	eprintln!("scene bounds: {world_min:?} -> {world_max:?}");
 
 	let import_config = ImportConfig {
 		voxel_size,
-		world_min,
-		world_max,
-		chunk_size: 64,
-		palette_path: std::path::PathBuf::from("assets/colors/palette_256.png"),
+		depth,
+		palette_path: PathBuf::from("assets/colors/palette_256.png"),
 	};
 
-	let pack_config = PackConfig {
-		depth: 3,
-		world_min,
-		world_max,
-	};
+	let pack_config = PackConfig { depth, voxel_size };
 
 	let mut packer = pack(pack_config, &output)?;
-	import_gltf(&input, &import_config, |chunk| packer.add_chunk(chunk))?;
+	lattice::import::import(&input, &import_config, |chunk_idx, samples| {
+		packer.add_chunk(chunk_idx, samples).expect("packer error");
+	})?;
 	packer.finish()?;
-	eprintln!("Written to {}", output.display());
+
+	eprintln!("written to {}", output.display());
 	Ok(())
 }
