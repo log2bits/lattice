@@ -59,7 +59,8 @@ impl BitpackedArray {
 		let bit_pos = index << self.bits.trailing_zeros();
 		let bit_off = bit_pos & 31;
 		let mask = Self::mask(self.bits) << bit_off;
-		self.data[(bit_pos >> 5) as usize] = (self.data[(bit_pos >> 5) as usize] & !mask) | (value << bit_off);
+		self.data[(bit_pos >> 5) as usize] =
+			(self.data[(bit_pos >> 5) as usize] & !mask) | (value << bit_off);
 	}
 
 	pub fn repack_in_place(&mut self, new_bits: u8) {
@@ -76,11 +77,13 @@ impl BitpackedArray {
 		for step in 0..len {
 			let entry = if growing { len - 1 - step } else { step };
 			let old_pos = entry << old_bits.trailing_zeros();
-			let value = (self.data[(old_pos >> 5) as usize] >> (old_pos & 31)) & Self::mask(old_bits);
+			let value =
+				(self.data[(old_pos >> 5) as usize] >> (old_pos & 31)) & Self::mask(old_bits);
 			let new_pos = entry << new_bits.trailing_zeros();
 			let new_off = new_pos & 31;
 			let mask = Self::mask(new_bits) << new_off;
-			self.data[(new_pos >> 5) as usize] = (self.data[(new_pos >> 5) as usize] & !mask) | (value << new_off);
+			self.data[(new_pos >> 5) as usize] =
+				(self.data[(new_pos >> 5) as usize] & !mask) | (value << new_off);
 		}
 		if !growing {
 			self.data.truncate(new_word_count);
@@ -100,6 +103,10 @@ impl BitpackedArray {
 	}
 
 	fn mask(bits: u8) -> u32 {
-		if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 }
+		if bits == 32 {
+			u32::MAX
+		} else {
+			(1u32 << bits) - 1
+		}
 	}
 }

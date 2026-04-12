@@ -1,4 +1,4 @@
-use lattice::import::palette::rgb_to_oklab;
+use lattice::palette::rgb_to_oklab;
 use rayon::prelude::*;
 use std::env;
 
@@ -20,7 +20,9 @@ fn main() {
 	let input_path = &args[1];
 	let output_path = &args[2];
 
-	let palette_img = image::open("palette.png").expect("failed to open palette.png").into_rgb8();
+	let palette_img = image::open("palette.png")
+		.expect("failed to open palette.png")
+		.into_rgb8();
 
 	let palette: Vec<[u8; 3]> = palette_img.pixels().map(|p| [p[0], p[1], p[2]]).collect();
 
@@ -28,7 +30,9 @@ fn main() {
 
 	eprintln!("Loaded {} colors from palette.png.", palette.len());
 
-	let input = image::open(input_path).expect("failed to open input image").into_rgba8();
+	let input = image::open(input_path)
+		.expect("failed to open input image")
+		.into_rgba8();
 
 	let (w, h) = input.dimensions();
 	eprintln!("Palettizing {}x{} image...", w, h);
@@ -57,6 +61,8 @@ fn main() {
 		output.put_pixel(x, y, image::Rgba([r, g, b, a]));
 	}
 
-	output.save(output_path).expect("failed to save output image");
+	output
+		.save(output_path)
+		.expect("failed to save output image");
 	eprintln!("Saved to {output_path}.");
 }

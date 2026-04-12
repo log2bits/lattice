@@ -1,0 +1,118 @@
+pub mod geometry;
+pub mod gltf;
+pub mod io;
+pub mod lattice;
+pub mod scene;
+pub mod vox;
+pub mod voxelizer;
+
+use crate::convert::scene::Scene;
+use crate::convert::voxelizer::VoxelizationMode;
+use std::error::Error;
+use std::path::Path;
+
+/// Configuration required by the voxelizer.
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Voxelization options")]
+pub struct VoxelizationConfig {
+	/// The resolution of the output model
+	#[arg(short, long, default_value_t = 1024)]
+	pub res: u32,
+
+	/// The mode of voxelization. Defaults to triangles,
+	/// but you can voxelize the wireframe or vertices
+	/// instead.
+	#[arg(long, default_value_t = VoxelizationMode::Triangles)]
+	pub mode: VoxelizationMode,
+}
+
+/// Base trait for supported 3D file formats.
+pub trait Format {
+	/// The orthogonal basis matrix defining the format's coordinate system.
+	/// Column major, equivalent to [`glam::Mat4::to_cols_array_2d`]
+	///
+	/// You can translate from an input format's coordinate system into an output
+	/// format's coordinate system with the `output_basis.inverse() * input_basis`
+	/// matrix.
+	const BASIS: [[f32; 4]; 4];
+}
+
+/// Base trait for supported input file formats.
+pub trait InputFormat: Format {
+	/// The specific format config required by this format
+	type Config;
+	/// The error type returned by this format when it fails
+	/// to read/load.
+	type Error: Error + From<std::io::Error>;
+
+	/// Loads the scene from the provided reader using this format.
+	///
+	/// The scene will be transformed using the `transform_matrix`.
+	///
+	/// # Errors
+	/// This depends on the exact implementation of the format. Usually
+	/// missing or malformed files or unsupported features will cause
+	/// erros.
+	fn read<R: io::SceneReader>(
+		transform_matrix: [[f32; 4]; 4],
+		reader: R,
+		format_config: Self::Config,
+	) -> Result<Scene, Self::Error>;
+
+	/// Loads the scene from the file at `path` using this format.
+	///
+	/// The scene will be transformed using the `transform_matrix`.
+	///
+	/// # Errors
+	/// This depends on the exact implementation of the format. Usually
+	/// missing or malformed files or unsupported features will cause
+	/// erros.
+	fn load(
+		transform_matrix: [[f32; 4]; 4],
+		path: &Path,
+		format_config: Self::Config,
+	) -> Result<Scene, Self::Error> {
+		let reader = io::LocalFile::open(path)?;
+
+		Self::read(transform_matrix, reader, format_config)
+	}
+}
+
+/// Base trait for supported output file formats.
+pub trait OutputFormat: Format {
+	/// The specific format config required by this format
+	type Config;
+	/// The error type returned by this format when it fails
+	/// to write/save.
+	type Error: Error + From<std::io::Error>;
+
+	/// Voxelizes and writes the scene to `writer` using this format.
+	///
+	/// # Errors
+	/// This depends on the exact implementation of the format. Usually
+	/// missing or malformed files or unsupported features will cause
+	/// erros.
+	fn voxelize_and_write<W: io::SceneWriter>(
+		scene: Scene,
+		writer: W,
+		format_config: Self::Config,
+		voxelization_config: &VoxelizationConfig,
+	) -> Result<(), Self::Error>;
+
+	/// Voxelizes and saves the scene at `path` using this format.
+	///
+	/// # Errors
+	/// This depends on the exact implementation of the format. Usually
+	/// missing or malformed files or unsupported features will cause
+	/// erros.
+	fn voxelize_and_save(
+		scene: Scene,
+		path: &Path,
+		format_config: Self::Config,
+		voxelization_config: &VoxelizationConfig,
+	) -> Result<(), Self::Error> {
+		let writer = io::LocalFile::create(path)?;
+
+		Self::voxelize_and_write(scene, writer, format_config, voxelization_config)
+	}
+}
