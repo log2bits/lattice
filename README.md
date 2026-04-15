@@ -137,7 +137,7 @@ The table is built during packing by collecting all unique voxel values in the c
 
 ---
 
-## Grid
+## World
 
 The world is a flat 3D grid of chunk entries. Dimensions are computed at import time from the scene's bounding box. Each entry is either a chunk index, a proxy (only blended material metadata loaded), or empty.
 
@@ -228,11 +228,11 @@ Per chunk (chunk_count times):
     occupancy       [u64; node_count]
     solid_mask      [u64; node_count]
     children_offset [u32; node_count]
-    blended_mat     bitpacked (table bit width)
+    lod_materials   bitpacked (table bit width)
     child_indices   bitpacked (level bit width)
     leaf_indices    bitpacked (table bit width)
 
-Grid:
+World:
   entries           [u32; grid_dims.x * grid_dims.y * grid_dims.z]
 ```
 
