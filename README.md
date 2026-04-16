@@ -119,7 +119,9 @@ At the deepest level, every child is a voxel. There are no child node indices, o
 
 Child node indices and leaf material indices live in separate arrays to avoid polluting each other's bit width. If they shared an array, flag entries would force widening to 32 bits.
 
-Child node indices are bitpacked at ceil(log2(level size)) bits, set once per level after construction. Leaf material indices are bitpacked at ceil(log2(table size)) bits, set per chunk. A chunk with 16 unique voxels stores everything at 4 bits per entry. One with 200 uses 8 bits.
+Bit widths are restricted to powers of 2: {1, 2, 4, 8, 16, 32}. This avoids cross-word reads where a single entry spans two u32s, which would require two loads on the GPU.
+
+Child node indices are bitpacked at the next power of 2 above ceil(log2(level size)) bits, set once per level after construction. Leaf material indices are bitpacked at the next power of 2 above ceil(log2(table size)) bits, set per chunk. A chunk with 16 unique voxels stores everything at 4 bits per entry. One with 200 uses 8 bits.
 
 ### Blended material
 

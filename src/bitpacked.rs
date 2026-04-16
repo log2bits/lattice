@@ -36,9 +36,7 @@ impl BitpackedArray {
 
 	#[inline]
 	pub fn push(&mut self, value: u32) {
-		if self.bits < 32 && value >> self.bits != 0 {
-			self.repack_in_place(((32 - value.leading_zeros()) as u8).next_power_of_two());
-		}
+		self.ensure_width(value);
 		let bit_pos = self.len << self.bits.trailing_zeros();
 		let bit_offset = bit_pos & 31;
 		if bit_offset == 0 {
@@ -56,11 +54,19 @@ impl BitpackedArray {
 
 	#[inline]
 	pub fn set(&mut self, index: u32, value: u32) {
+		self.ensure_width(value);
 		let bit_pos = index << self.bits.trailing_zeros();
 		let bit_off = bit_pos & 31;
 		let mask = Self::mask(self.bits) << bit_off;
 		self.data[(bit_pos >> 5) as usize] =
 			(self.data[(bit_pos >> 5) as usize] & !mask) | (value << bit_off);
+	}
+
+	#[inline]
+	fn ensure_width(&mut self, value: u32) {
+		if self.bits < 32 && value >> self.bits != 0 {
+			self.repack_in_place(((32 - value.leading_zeros()) as u8).next_power_of_two());
+		}
 	}
 
 	pub fn repack_in_place(&mut self, new_bits: u8) {
