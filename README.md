@@ -1,41 +1,37 @@
 # Lattice
 
-A voxel renderer with path tracing, built in Rust + WebGPU. Import a glTF scene, voxelize it into a grid of sparse 64-trees, and render it with GPU ray tracing in the browser.
+A voxel renderer with path tracing, built in Rust + WebGPU.
 
-The offline tool converts glTF to `.lattice` or `.vox`. The viewer loads a `.lattice` file, uploads partial tree data to the GPU based on camera distance, and traces rays in a compute shader. Voxels can be edited at runtime (place emissive blocks, see the lighting change live) but edits aren't saved to disk. It's a tech demo, not a game engine.
+---
 
-Compiles to native and WASM. Uses rayon for CPU parallelism, WebGPU/WGSL for rendering, and targets wasm_bindgen_rayon for threaded WASM builds.
+# Priorities
+
+1. Extremely fast ray traversal
+2. Wonderful compression
+3. Moderately fast editability
 
 ---
 
 # Optimizations
 
-### Importing from glTF
-
-1. 256-color palette spread across OKLab space via sample elimination, used only at import time
-2. 16MB precomputed LUT maps every sRGB triplet to the nearest palette entry in O(1)
-3. Scene is spatially partitioned into chunks before voxelization, so only overlapping triangles are sent to each chunk's voxelizer
-4. Chunks are independent and parallelize trivially across threads with rayon
-5. Fat voxelization guarantees 6-connected (watertight) surfaces
-6. Conservative wireframe rasterization catches thin triangles that the area rasterizer would miss due to aliasing
-7. Interior voxels (all 6 face-neighbors occupied and opaque) are culled after voxelization since they're never visible
-
 ### Storage
 
-1. Each chunk is a sparse voxel 64-tree (not an octree), so nodes encode 64 children instead of 8, cutting per-voxel overhead to ~0.19 bytes vs ~0.57 for SVOs
+1. Each chunk is a sparse voxel 64-tree (not an octree), so nodes encode 64 children instead of 8, cutting per-voxel overhead.
 2. No DAG, so edits are O(depth) with no CoW, rehashing, or refcounting
 3. Each node stores a 64-bit occupancy mask and a 64-bit solid mask, which tracks uniform subtrees that terminate traversal early
-4. Per-chunk material tables deduplicate on the full 32-bit voxel value (color + roughness + flags), not just color
+4. Per-chunk material tables deduplicate on the full 32-bit voxel value (color + roughness + flags).
 5. Child node indices and leaf material indices are stored in separate bitpacked arrays so leaf entries don't inflate pointer bit widths
 6. All bitpacked widths scale with their contents: a chunk with 16 unique materials uses 4-bit indices everywhere
 7. Each tree level is SoA, so GPU warps reading the same field across many nodes hit contiguous memory
 8. Each node stores a blended subtree material computed bottom-up, enabling LOD without separate LOD trees
 9. The `.lattice` file stores each chunk's levels top-down (coarsest first) so partial reads can stop early
+10. Voxel edits are added to a queue where the affected chunks are rebuilt each frame in bulk.
+11. Edits are streamed to the GPU in sections of edits, instead of uploading the entire chunk at once.
 
 ### Rendering
 
-1. Partial tree upload: CPU sends only the top N levels per chunk to VRAM based on camera distance, so VRAM cost tracks visible detail, not scene size
-2. Upload depth is continuous (1, 2, 3, or 4 levels per chunk), not discrete LOD steps
+1. Rendered with ray tracing + beam optimization. (No rasterization)
+2. Partial tree upload: CPU sends only the top N levels per chunk to VRAM based on camera distance, so VRAM cost tracks visible detail, not scene size
 3. Traversal uses an ancestor stack caching parent node indices, so stepping into neighbor cells doesn't restart from the root
 4. Coarse occupancy check groups the 64-bit occupancy into 8 regions of 2x2x2, enabling 8-cell skips over empty space
 5. Coordinate flipping maps all rays into the negative octant, halving the branch count in the DDA inner loop
@@ -51,29 +47,9 @@ Compiles to native and WASM. Uses rayon for CPU parallelism, WebGPU/WGSL for ren
 
 ---
 
-## Pipeline
-
-```
-gltf scene
-  -> triangle partitioning per chunk
-  -> per-chunk voxelization (parallel)
-  -> morton-sorted voxel sample stream per chunk
-  -> bottom-up 64-tree construction
-  -> .lattice or .vox file on disk
-
-.lattice file
-  -> full tree in RAM
-  -> partial tree upload to VRAM (LOD)
-  -> GPU ray traversal
-```
-
-Conversion happens offline in a native CLI tool. Loading, uploading, rendering, and editing happen at runtime in the viewer (native or WASM).
-
----
-
 ## Voxel
 
-Every voxel is a 32-bit value. The color is full 24-bit linear RGB, not palette-indexed. The palette only exists during glTF import to keep per-chunk material tables small. Other importers (procedural, `.vox`, etc.) can skip the palette and use arbitrary colors.
+Every voxel is a 32-bit value. The color is full 24-bit linear RGB, not palette-indexed. 
 
 ```
 Voxel (u32):
@@ -86,30 +62,15 @@ Voxel (u32):
   bit   0     reserved
 ```
 
-Zero-cost conversion to/from u32.
-
 ---
 
 ## Sparse Voxel 64-Tree
 
 Each chunk is a sparse tree where every node covers a 4x4x4 block of children (64 slots). Tree depth is configurable and determines chunk resolution: depth 4 gives 4^4 = 256 voxels per side, depth 3 gives 64, etc.
 
-No DAG. Every node is unique and owns its children. This keeps edits trivial: walk down, change a leaf, update the blended material on the way back up. No copy-on-write, no rehashing, no reference counting.
-
 ### SoA layout
 
 Each tree level is stored as a set of parallel arrays, one per field. A warp of 32 GPU threads reading occupancy for 32 different nodes hits one contiguous memory region. AoS would scatter those reads across cache lines.
-
-Per level:
-
-| Field | Description |
-|---|---|
-| occupancy (64-bit per node) | Which of 64 slots have something in them |
-| solid mask (64-bit per node) | Which occupied children are uniform (whole subtree is one material, stop here) |
-| children offset (32-bit per node) | Where this node's children begin in the two child arrays |
-| blended material (bitpacked) | Blended material index per node, used when LOD cuts traversal short |
-| child node indices (bitpacked) | Indices into the next level |
-| leaf material indices (bitpacked) | Material table indices for solid subtree children |
 
 A child is either an index into the next level (descend further) or a material table index meaning the entire subtree is one material (stop traversing). The solid mask tells you which is which. The popcount of occupancy gives the child count for a node.
 
@@ -121,8 +82,6 @@ Child node indices and leaf material indices live in separate arrays to avoid po
 
 Bit widths are restricted to powers of 2: {1, 2, 4, 8, 16, 32}. This avoids cross-word reads where a single entry spans two u32s, which would require two loads on the GPU.
 
-Child node indices are bitpacked at the next power of 2 above ceil(log2(level size)) bits, set once per level after construction. Leaf material indices are bitpacked at the next power of 2 above ceil(log2(table size)) bits, set per chunk. A chunk with 16 unique voxels stores everything at 4 bits per entry. One with 200 uses 8 bits.
-
 ### Blended material
 
 Every node stores a blended subtree material: the dominant material of its subtree, computed bottom-up at pack time. When the GPU hits a node whose children weren't uploaded (too far away for full detail), it reads this value and renders the node as a solid colored cube.
@@ -133,9 +92,9 @@ This also appears at the bottom level for consistency, but there it's just the a
 
 ## Material Table
 
-Each chunk has its own material table mapping indices to full 32-bit voxel values. Two voxels with the same RGB but different roughness are distinct entries.
+Each chunk has its own material table mapping indices to full 32-bit voxel values.
 
-The table is built during packing by collecting all unique voxel values in the chunk's subtree. The bit width of all material index fields scales with table size, so chunks with few unique materials compress better.
+The table is built during packing by collecting all unique voxel values in the chunk's subtree. The bit width of all material index fields scales with table size, so chunks with few unique materials compress much better.
 
 ---
 
@@ -157,126 +116,11 @@ This is continuous, not discrete LOD steps. You can send exactly 1, 2, 3, or 4 l
 
 No separate LOD trees, no LOD construction pipeline, no extra disk storage. Just upload less of the same tree.
 
-### Upload strategy
-
-Each frame the CPU walks the grid, computes a target upload depth per chunk based on distance and screen-space projected size, and diffs against what's currently in the GPU buffer. Changed chunks get re-uploaded. The GPU buffers are structured so each level is contiguous and can be updated independently.
-
----
-
-## Conversion
-
-The converter turns a glTF scene into either a `.lattice` file or a `.vox` file.
-
-### Color palette
-
-A 256-entry color palette is spread across OKLab space via sample elimination. A 16MB lookup table maps every possible sRGB triplet to the nearest palette entry. This only exists during glTF import to keep chunk material tables small. The palette is not part of the tree or the file format.
-
-### Triangle partitioning
-
-One pass over all meshes builds a flat triangle list and a partition map from chunk grid coordinates to triangle indices. Each triangle goes into every chunk whose AABB it overlaps.
-
-### Voxelization
-
-Per chunk, in parallel across threads: clip triangles to the chunk AABB, rasterize them using barycentric projection with fat voxelization (guarantees 6-connected surfaces for interior culling), sample texture colors, snap to palette, emit morton-sorted voxel sample runs.
-
-Fat voxelization is important. Without it, thin shells have gaps, and the "all 6 neighbors occupied" interior culling check fails, wasting memory on invisible voxels.
-
-The voxelization approach is adapted from voxquant. Project each triangle onto its dominant axis plane, iterate the 2D bounding box, solve for the depth coordinate via the plane equation, emit voxels. Conservative rasterization via wireframe ensures no gaps from aliasing on thin triangles.
-
-### Interior culling
-
-After voxelization, any voxel with all 6 face-neighbors occupied and opaque is culled. These voxels are never visible from any direction.
-
----
-
-## Packing
-
-The packer takes per-chunk voxel sample streams and builds the tree.
-
-### Morton sort
-
-Each chunk's samples arrive sorted in morton order from the voxelizer. Chunks are independent so each stream is processed separately.
-
-### Bottom-up construction
-
-The tree is built bottom-up from sorted samples. Leaf nodes are created first, then parent nodes from groups of 64 children. Uniform subtrees (all children are the same material) collapse into a single leaf material entry in the parent, and the parent's solid mask bit is set. The blended material is computed during this pass by blending children bottom-up.
-
-### Finalization
-
-After the tree is built, unique voxel values are collected into the chunk's material table. All material index fields are bitpacked to their final width based on table size. Child node index arrays are bitpacked based on level size at each depth.
-
-### Serialization
-
-The finished tree is written to a `.lattice` file. Chunks are stored contiguously and independently so the format is trivially streamable later if needed. Each chunk's data is written top-down (coarsest level first) so partial reads for LOD can stop early.
-
----
-
-## .lattice File Format
-
-```
-Header:
-  magic             [u8; 8]     "LATTICE\0"
-  version           u32
-  depth             u8
-  grid_dims         [u32; 3]
-  chunk_count       u32
-  voxel_size_m      f32         meters per voxel (e.g. 0.1)
-
-Per chunk (chunk_count times):
-  table_size        u32
-  table_values      [u32; table_size]
-  per level (top-down, coarsest first):
-    node_count      u32
-    occupancy       [u64; node_count]
-    solid_mask      [u64; node_count]
-    children_offset [u32; node_count]
-    lod_materials   bitpacked (table bit width)
-    child_indices   bitpacked (level bit width)
-    leaf_indices    bitpacked (table bit width)
-
-World:
-  entries           [u32; grid_dims.x * grid_dims.y * grid_dims.z]
-```
-
-Top-down per chunk means you can read just the first 1-2 levels for a far chunk and stop. No seeking.
-
----
-
-## Rendering
-
-GPU ray tracing in WebGPU compute shaders. One thread per pixel, each thread casts a ray through the scene.
-
-### V1: Primary rays only
-
-Cast one ray per pixel from the camera. Traverse the 64-tree using DDA with the ancestor stack trick. When a leaf is hit, read the material and shade with direct sun lighting. When a node has no uploaded children (LOD cutoff), use the blended material and render as a solid cube.
-
-The ancestor stack caches parent node indices so stepping into neighbor cells doesn't require restarting from the root. The coarse occupancy check groups the 64-bit occupancy into 8 coarse 2x2x2 regions, letting the traversal skip over empty regions in 2^3 steps at once.
-
-### Later: Path tracing
-
-Bidirectional. Rays from the camera bounce off surfaces, rays from light sources (sun, emissive voxels) cast into the scene. Emissive voxels are discovered by camera rays and added to a light list.
-
-Every voxel face gets a unique ID. Lighting values are accumulated per-face across frames, doing spatial and temporal averaging. Mirror surfaces average less, diffuse surfaces average more. Faces that haven't been updated recently get evicted.
-
-### Debug overlays
-
-Normals, depth, LOD depth per chunk, traversal iteration heatmap, voxel grid lines. Toggled at runtime.
-
----
-
-## Editing
-
-At runtime, the user can place and remove individual voxels. The main use case is dropping emissive voxels into the scene to watch the lighting change.
-
-An edit walks down the tree to the target leaf, modifies it (or inserts/removes a child), then walks back up updating the blended material along the path. If the edit adds a new unique voxel value, the chunk's material table is extended and affected bitpacked arrays are recomputed. The modified chunk data is re-uploaded to the GPU.
-
-O(depth) work per edit. No CoW, no DAG overhead.
-
 ---
 
 ## Resources
 
-### Key References
+### References
 
 | Reference | Why it matters |
 |---|---|
