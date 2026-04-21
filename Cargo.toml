@@ -12,9 +12,11 @@ bytemuck = { version = "1", features = ["derive"] }
 image = "0.25.10"
 profiling = "1.0.17"
 rand = { version = "0.8", features = ["small_rng"] }
+radsort = "0.1"
 rayon = "1"
 wgpu = "22"
 winit = "0.30"
+rustc-hash = "2.1.2"
 
 [profile.release]
 opt-level = 3

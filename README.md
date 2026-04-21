@@ -16,26 +16,42 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ### Storage
 
-1. Each chunk is a sparse voxel 64-tree (not an octree), so nodes encode 64 children instead of 8, cutting per-voxel overhead.
-2. No DAG, so edits are O(depth) with no CoW, rehashing, or refcounting
-3. Each node stores a 64-bit occupancy mask and a 64-bit solid mask, which tracks uniform subtrees that terminate traversal early
-4. Per-chunk material tables deduplicate on the full 32-bit voxel value (color + roughness + flags).
-5. Child node indices and leaf material indices are stored in separate bitpacked arrays so leaf entries don't inflate pointer bit widths
-6. All bitpacked widths scale with their contents: a chunk with 16 unique materials uses 4-bit indices everywhere
-7. Each tree level is SoA, so GPU warps reading the same field across many nodes hit contiguous memory
-8. Each node stores a blended subtree material computed bottom-up, enabling LOD without separate LOD trees
-9. The `.lattice` file stores each chunk's levels top-down (coarsest first) so partial reads can stop early
-10. Voxel edits are added to a queue where the affected chunks are rebuilt each frame in bulk.
-11. Edits are streamed to the GPU in sections of edits, instead of uploading the entire chunk at once.
+1. Each chunk is a sparse voxel 64-tree (not an octree), so nodes encode 64 children instead of 8, cutting per-voxel overhead
+2. Per-chunk SVDAG: after each rebuild, identical nodes within a level are deduplicated bottom-up. Interior regions collapse to zero leaf nodes (uniform terminal propagates up). Surface patterns vary: a sphere of radius 8 has ~38 unique leaf patterns; a sphere of radius 32 has ~736. Compression scales with how much structural repetition the geometry has.
+3. A `terminal_mask` per node marks subtrees that terminate early (uniform material), avoiding unnecessary descent
+4. The `materials` array at every level is fully packed with no gaps: terminal slots store the exact or collapsed material, non-terminal slots store the LOD representative. No separate LOD field needed
+5. `node_children` and `materials` share a single `children_offset` with lock-step indexing. Terminal slots in `node_children` hold zero; only non-terminal slots carry child indices
+6. Per-chunk material tables deduplicate on the full 32-bit voxel value
+7. Bitpacked widths are powers of 2 and scale with content: 4 bits for ≤16 materials, 8 for ≤256, etc.
+8. SoA layout per level: GPU warps reading one field across many nodes hit contiguous memory
+9. Chunk levels stored top-down (coarsest first) so partial file reads for LOD can stop early
+
+### Editing
+
+1. Edits are queued and flushed in batches each frame
+2. Edit-aware partial rebuild: sort edits by tree-order key, then walk top-down. For each node, find which children have at least one edit in their address range. Children with no edits are copied by index unchanged. Children with edits are recursed into, producing new nodes appended to the existing level arrays. Cost is O(depth × edits).
+3. Terminal subtrees are always copied by index, never expanded to individual voxels.
+4. Dirty-node tracking in a DAG doesn't work cleanly - a single canonical node can be shared by many parents, so any in-place modification would require copy-on-write to un-share it first. The path-walk approach sidesteps this entirely: new nodes are appended and old orphans are swept by the canonicalize pass.
+5. Canonicalize (SVDAG dedup + compaction) after each flush - rebuilds level arrays with only reachable canonical nodes, removing the orphaned nodes left by the partial rebuild.
+
+### Shape Editing
+
+Individual voxel edits are just one case. The edit walk generalizes to any shape with an AABB test:
+
+- **Full coverage** (node AABB entirely inside shape): set subtree to terminal with the fill material, no recursion
+- **No coverage** (node AABB entirely outside shape): copy subtree unchanged, no recursion
+- **Partial coverage**: recurse into children
+
+This gives O(surface area) cost for any shape - a 64³ rectangular fill touches a handful of border nodes rather than 262k individual voxels. Works for rectangles, spheres, capsules, or any SDF. Heightmap terrain generation is a column-wise variant of the same walk.
 
 ### Rendering
 
-1. Rendered with ray tracing + beam optimization. (No rasterization)
-2. Partial tree upload: CPU sends only the top N levels per chunk to VRAM based on camera distance, so VRAM cost tracks visible detail, not scene size
-3. Traversal uses an ancestor stack caching parent node indices, so stepping into neighbor cells doesn't restart from the root
-4. Coarse occupancy check groups the 64-bit occupancy into 8 regions of 2x2x2, enabling 8-cell skips over empty space
-5. Coordinate flipping maps all rays into the negative octant, halving the branch count in the DDA inner loop
-6. LOD cutoff: when a node has no uploaded children, the GPU reads the blended subtree material and renders one colored cube instead of descending
+1. Rendered with ray tracing + beam optimization
+2. Partial tree upload: CPU sends only the top N levels per chunk to VRAM based on camera distance
+3. LOD cutoff: when a node has no uploaded children, the GPU reads `materials[child_idx]` on the current node and renders a solid cube instead of descending
+4. Traversal uses an ancestor stack caching parent node indices, so stepping into neighbor cells doesn't restart from root
+5. Coarse occupancy groups the 64-bit mask into 8 regions of 2×2×2, enabling 8-cell skips over empty space
+6. Coordinate flipping maps all rays into the negative octant, halving branch count in the DDA inner loop
 
 ### Later (path tracing)
 
@@ -49,72 +65,82 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ## Voxel
 
-Every voxel is a 32-bit value. The color is full 24-bit linear RGB, not palette-indexed. 
-
 ```
-Voxel (u32):
-
-  bits 31-8   rgb          24-bit linear RGB color
-  bits  7-4   roughness    nibble, 0 = mirror, 15 = fully diffuse
-  bit   3     emissive     emits light at its albedo color
-  bit   2     metallic     conductor, albedo tints specular
-  bit   1     transparent  refracts rather than reflects
-  bit   0     reserved
+bits 31-8   rgb          24-bit linear RGB color
+bits  7-4   roughness    0 = mirror, 15 = fully diffuse
+bit   3     emissive     emits light at its albedo color
+bit   2     metallic     albedo tints specular
+bit   1     transparent  refracts rather than reflects
+bit   0     reserved
 ```
 
 ---
 
-## Sparse Voxel 64-Tree
+## Level
 
-Each chunk is a sparse tree where every node covers a 4x4x4 block of children (64 slots). Tree depth is configurable and determines chunk resolution: depth 4 gives 4^4 = 256 voxels per side, depth 3 gives 64, etc.
+```rs
+pub struct Level {
+    pub occupancy_mask: Vec<u64>,
+    pub terminal_mask: Vec<u64>,
+    pub children_offset: Vec<u32>,
+    pub node_children: BitpackedArray,
+    pub materials: BitpackedArray,
+}
+```
 
-### SoA layout
+`occupancy_mask`: which of 64 slots are occupied per node.
 
-Each tree level is stored as a set of parallel arrays, one per field. A warp of 32 GPU threads reading occupancy for 32 different nodes hits one contiguous memory region. AoS would scatter those reads across cache lines.
+`terminal_mask`: which occupied slots terminate here. If set, `materials[child_idx]` is the material. If unset, `node_children[child_idx]` is the child node index to descend into.
 
-A child is either an index into the next level (descend further) or a material table index meaning the entire subtree is one material (stop traversing). The solid mask tells you which is which. The popcount of occupancy gives the child count for a node.
+`children_offset`: start of this node's child block in both arrays. Child index = `children_offset[node] + popcount(occupancy_mask & ((1 << slot) - 1))`.
 
-At the deepest level, every child is a voxel. There are no child node indices, only leaf material indices. The solid mask equals occupancy because there's nothing further to descend into.
+`materials`: fully packed, one entry per occupied slot. Unified across all levels - at the leaf level these are the actual voxel colors; at higher levels they are the LOD representative for that subtree. Terminal slots hold the exact uniform material (which is also the LOD). Non-terminal slots hold the mode (most common material) of the children's `materials` entries, computed bottom-up during construction. No zeros, no gaps.
 
-### Bitpacking
+`node_children`: lock-step with `materials`. Non-terminal slots hold child node indices; terminal slots hold zero.
 
-Child node indices and leaf material indices live in separate arrays to avoid polluting each other's bit width. If they shared an array, flag entries would force widening to 32 bits.
-
-Bit widths are restricted to powers of 2: {1, 2, 4, 8, 16, 32}. This avoids cross-word reads where a single entry spans two u32s, which would require two loads on the GPU.
-
-### Blended material
-
-Every node stores a blended subtree material: the dominant material of its subtree, computed bottom-up at pack time. When the GPU hits a node whose children weren't uploaded (too far away for full detail), it reads this value and renders the node as a solid colored cube.
-
-This also appears at the bottom level for consistency, but there it's just the average of the node's voxels. The real per-voxel data is in the leaf material indices.
+At the leaf level all slots are terminal and `node_children` is empty - it carries no data.
 
 ---
 
-## Material Table
+## Tree Construction
 
-Each chunk has its own material table mapping indices to full 32-bit voxel values.
+Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same material, the group collapses to a single terminal entry in the parent - no node is allocated.
 
-The table is built during packing by collecting all unique voxel values in the chunk's subtree. The bit width of all material index fields scales with table size, so chunks with few unique materials compress much better.
+After construction, a canonicalization pass deduplicates identical nodes level-by-level, bottom-up. Two nodes are identical if they have the same `occupancy_mask`, `terminal_mask`, and child values at every occupied slot (with already-remapped indices from deeper levels, so comparison is structurally exact). Duplicates are merged to their canonical copy; parent `node_children` references are remapped. The pass rebuilds each level's arrays from scratch containing only reachable canonical nodes, so it also compacts away orphaned nodes left by partial rebuilds. This is the per-chunk SVDAG reduction.
 
 ---
 
 ## World
 
-The world is a flat 3D grid of chunk entries. Dimensions are computed at import time from the scene's bounding box. Each entry is either a chunk index, a proxy (only blended material metadata loaded), or empty.
+Flat 3D grid of independent chunks. No cross-chunk node sharing - this would break per-chunk LOD streaming. At depth 4 each chunk covers 256³ voxels. The grid expands dynamically as the player explores.
 
-At depth 4, each chunk covers 256^3 voxels. At 10cm voxel size, that's a 25.6m cube per chunk. A 500m scene is roughly 20x20x20 chunks.
+Most chunks are ephemeral: generated procedurally on demand and not stored. When a chunk receives its first voxel edit, the full procedural content is generated and baked together with the edit into a single SVDAG, which is then persisted. From that point the chunk is stored as a pure SVDAG - the procedural recipe is no longer used. The SVDAG is the ground truth, not a separate edit log on top of a procedural base.
 
 ---
 
-## LOD via Partial Upload
+## Terrain
 
-The full tree lives in RAM. When uploading to VRAM, the CPU decides how many levels to send per chunk based on camera distance.
+Procedural terrain is generated chunk by chunk on demand. The solid collapse optimization makes this extremely efficient: below the surface is a large uniform solid region, above is air - both terminate high in the tree. Only the thin surface layer needs full leaf resolution.
 
-A nearby chunk gets all 4 levels (full detail). A far chunk gets 2 (the GPU traverses down, hits a node with no uploaded children, reads the blended material, renders a colored cube). A chunk at the horizon might get just level 0 (the root node, one color for the whole 25.6m cube).
+Terrain is generated via noise-based heightmaps with erosion and layered geology. The shape edit API drives generation: for each chunk, test columns against the heightmap using the AABB walk, collapsing solid and empty regions immediately without ever expanding them to individual voxels.
 
-This is continuous, not discrete LOD steps. You can send exactly 1, 2, 3, or 4 levels per chunk. VRAM cost scales with what's actually visible at usable detail, not total scene size.
+Material transitions between geology layers use a dithered boundary: instead of a hard horizontal cut, each voxel samples `hash(world_pos) < blend_factor(height)` to decide which material it belongs to. This produces natural-looking stochastic transitions at zero memory cost, since the hash is computed on the fly during generation.
 
-No separate LOD trees, no LOD construction pipeline, no extra disk storage. Just upload less of the same tree.
+Terrain features like caves, boulders, and overhangs are driven by the same parameterized shape API used for edits (spheres, capsules, SDFs), making them first-class citizens of the generation pipeline rather than special cases.
+
+---
+
+## LOD
+
+LOD is implemented as a cascade of larger chunks, not as partial uploads of a single tree.
+
+A depth-4 chunk covers 256³ voxels with leaf resolution of 1³. A LOD-1 chunk is 4x larger spatially (1024³ coverage) using the same depth-4 structure, so each leaf covers 4³ original voxels. LOD-2 covers 4096³ with each leaf covering 16³ original voxels, and so on.
+
+The 4x scale factor is intentional: the 64-tree's internal levels are already 4x steps (level 0 = 1 voxel, level 1 = 4³, level 2 = 16³, level 3 = 64³). So a LOD-1 leaf corresponds exactly to a level-2 internal node in the original chunk. The representative material for that node is already computed during flush (`node_lod` walks the children and picks the most common material). Building a LOD chunk from a set of full-res chunks is just lifting their level-2 nodes out and using them as leaves - no fresh downsampling pass needed.
+
+When an edited chunk is re-flushed, the LOD chunk covering that region is rebuilt from the updated full-res SVDAG.
+
+For rendering, the GPU simply traverses the LOD cascade by distance. The existing "no uploaded children → shade a solid cube" fallback applies here too: distant chunks are LOD chunks, which are already coarse SVDAGs with the same structure as any other chunk.
 
 ---
 

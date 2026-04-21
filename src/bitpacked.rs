@@ -97,6 +97,35 @@ impl BitpackedArray {
 		self.bits = new_bits;
 	}
 
+	pub fn insert(&mut self, index: u32, value: u32) {
+		assert!(index <= self.len);
+		self.ensure_width(value);
+		let tail = if self.len > 0 {
+			self.get(self.len - 1)
+		} else {
+			0
+		};
+		self.push(tail);
+		let mut i = self.len - 1;
+		while i > index {
+			self.set(i, self.get(i - 1));
+			i -= 1;
+		}
+		self.set(index, value);
+	}
+
+	pub fn remove(&mut self, index: u32) -> u32 {
+		assert!(index < self.len);
+		let removed = self.get(index);
+		for i in index..self.len - 1 {
+			self.set(i, self.get(i + 1));
+		}
+		self.len -= 1;
+		let new_word_count = ((self.len as usize * self.bits as usize) + 31) >> 5;
+		self.data.truncate(new_word_count);
+		removed
+	}
+
 	pub fn repack(&self, new_bits: u8) -> Self {
 		let mut out = self.clone();
 		out.repack_in_place(new_bits);
