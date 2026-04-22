@@ -16,23 +16,22 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ### Storage
 
-1. Each chunk is a sparse voxel 64-tree (not an octree), so nodes encode 64 children instead of 8, cutting per-voxel overhead
-2. Per-chunk SVDAG: after each rebuild, identical nodes within a level are deduplicated bottom-up. Interior regions collapse to zero leaf nodes (uniform terminal propagates up). Surface patterns vary: a sphere of radius 8 has ~38 unique leaf patterns; a sphere of radius 32 has ~736. Compression scales with how much structural repetition the geometry has.
-3. A `terminal_mask` per node marks subtrees that terminate early (uniform material), avoiding unnecessary descent
-4. The `materials` array at every level is fully packed with no gaps: terminal slots store the exact or collapsed material, non-terminal slots store the LOD representative. No separate LOD field needed
-5. `node_children` and `materials` share a single `children_offset` with lock-step indexing. Terminal slots in `node_children` hold zero; only non-terminal slots carry child indices
-6. Per-chunk material tables deduplicate on the full 32-bit voxel value
-7. Bitpacked widths are powers of 2 and scale with content: 4 bits for ≤16 materials, 8 for ≤256, etc.
-8. SoA layout per level: GPU warps reading one field across many nodes hit contiguous memory
-9. Chunk levels stored top-down (coarsest first) so partial file reads for LOD can stop early
+1. Each chunk is an ESVC (Efficient Sparse Voxel Contree): a sparse 64-tree (not an octree) where nodes encode 64 children instead of 8, cutting per-voxel overhead
+2. A `terminal_mask` per node marks subtrees that terminate early (uniform material), avoiding unnecessary descent
+3. `materials` is fully packed with one entry per occupied slot and does double duty: terminal slots store the exact uniform material, non-terminal slots store the LOD representative. One array, no separate LOD field, no gaps.
+4. `node_children` and `materials` share a single `children_offset` with lock-step indexing. Terminal slots in `node_children` hold zero; only non-terminal slots carry child indices
+5. Per-chunk material tables deduplicate on the full 32-bit voxel value
+6. Bitpacked widths are powers of 2 and scale with content: 4 bits for ≤16 materials, 8 for ≤256, etc.
+7. SoA layout per level: GPU warps reading one field across many nodes hit contiguous memory
+8. Chunk levels stored top-down (coarsest first) so partial file reads for LOD can stop early
 
 ### Editing
 
 1. Edits are queued and flushed in batches each frame
 2. Edit-aware partial rebuild: sort edits by tree-order key, then walk top-down. For each node, find which children have at least one edit in their address range. Children with no edits are copied by index unchanged. Children with edits are recursed into, producing new nodes appended to the existing level arrays. Cost is O(depth × edits).
 3. Terminal subtrees are always copied by index, never expanded to individual voxels.
-4. Dirty-node tracking in a DAG doesn't work cleanly - a single canonical node can be shared by many parents, so any in-place modification would require copy-on-write to un-share it first. The path-walk approach sidesteps this entirely: new nodes are appended and old orphans are swept by the canonicalize pass.
-5. Canonicalize (SVDAG dedup + compaction) after each flush - rebuilds level arrays with only reachable canonical nodes, removing the orphaned nodes left by the partial rebuild.
+4. New nodes are appended and old orphans are left in place during the walk, then swept in the compaction pass.
+5. Compact after each flush - rebuilds level arrays with only reachable nodes, removing orphans left by partial rebuilds.
 
 ### Shape Editing
 
@@ -52,6 +51,7 @@ This gives O(surface area) cost for any shape - a 64³ rectangular fill touches 
 4. Traversal uses an ancestor stack caching parent node indices, so stepping into neighbor cells doesn't restart from root
 5. Coarse occupancy groups the 64-bit mask into 8 regions of 2×2×2, enabling 8-cell skips over empty space
 6. Coordinate flipping maps all rays into the negative octant, halving branch count in the DDA inner loop
+7. Camera position is stored as integer chunk coordinates plus a chunk-local `vec3` offset always within `[0, 256]` voxels. All ray traversal happens in chunk-local space: when a ray exits a chunk the integer chunk coords are stepped and the ray origin is re-expressed relative to the new chunk. No large floats ever enter the traversal math, so f32 is sufficient for local coordinates regardless of world size.
 
 ### Later (path tracing)
 
@@ -94,7 +94,7 @@ pub struct Level {
 
 `children_offset`: start of this node's child block in both arrays. Child index = `children_offset[node] + popcount(occupancy_mask & ((1 << slot) - 1))`.
 
-`materials`: fully packed, one entry per occupied slot. Unified across all levels - at the leaf level these are the actual voxel colors; at higher levels they are the LOD representative for that subtree. Terminal slots hold the exact uniform material (which is also the LOD). Non-terminal slots hold the mode (most common material) of the children's `materials` entries, computed bottom-up during construction. No zeros, no gaps.
+`materials`: fully packed, one entry per occupied slot. Unified across all levels - at the leaf level these are the actual voxel colors; at higher levels they are the LOD representative for that subtree. Terminal slots hold the exact uniform material (which is also the LOD). Non-terminal slots hold the most common material among the children's `materials` entries, computed bottom-up during construction. Ties go to the first material. This means edits that don't change the dominant material in a subtree don't propagate LOD changes all the way up the tree. No zeros, no gaps.
 
 `node_children`: lock-step with `materials`. Non-terminal slots hold child node indices; terminal slots hold zero.
 
@@ -106,15 +106,23 @@ At the leaf level all slots are terminal and `node_children` is empty - it carri
 
 Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same material, the group collapses to a single terminal entry in the parent - no node is allocated.
 
-After construction, a canonicalization pass deduplicates identical nodes level-by-level, bottom-up. Two nodes are identical if they have the same `occupancy_mask`, `terminal_mask`, and child values at every occupied slot (with already-remapped indices from deeper levels, so comparison is structurally exact). Duplicates are merged to their canonical copy; parent `node_children` references are remapped. The pass rebuilds each level's arrays from scratch containing only reachable canonical nodes, so it also compacts away orphaned nodes left by partial rebuilds. This is the per-chunk SVDAG reduction.
+After construction, a compaction pass rebuilds each level's arrays from scratch containing only reachable nodes, removing orphans left by partial rebuilds.
 
 ---
 
 ## World
 
-Flat 3D grid of independent chunks. No cross-chunk node sharing - this would break per-chunk LOD streaming. At depth 4 each chunk covers 256³ voxels. The grid expands dynamically as the player explores.
+Chunks are stored in a hashmap keyed on integer (x, y, z) chunk coordinates, expanding lazily as the player explores. No cross-chunk node sharing - this would break per-chunk LOD streaming. At depth 4 each chunk covers 256³ voxels.
 
-Most chunks are ephemeral: generated procedurally on demand and not stored. When a chunk receives its first voxel edit, the full procedural content is generated and baked together with the edit into a single SVDAG, which is then persisted. From that point the chunk is stored as a pure SVDAG - the procedural recipe is no longer used. The SVDAG is the ground truth, not a separate edit log on top of a procedural base.
+There are two distinct edit types:
+
+**Procedural edits** (terrain, caves, boulders, etc.) are stored as a global ordered list of parameterized operations. Each operation has a bounding volume and a resolution level parameter. When any chunk is generated, the list is spatially queried for overlapping ops and they are applied in order using the shape edit API. At coarser LOD levels, operations skip sub-voxel detail: a high-frequency noise layer that produces centimeter-scale variation contributes nothing to a LOD chunk whose voxels are meters wide, so it is culled by level. The list is the authoritative world recipe and is always re-runnable.
+
+**Voxel edits** are individual voxel writes from player interaction. These are not stored as a log. Instead, the first voxel edit to a chunk triggers creation of a **persistent chunk**: the full procedural content is baked at that point, the voxel edit is applied on top, and the resulting ESVC is stored permanently. Subsequent voxel edits to that chunk use the existing partial-rebuild machinery directly on the stored ESVC. The ESVC is the ground truth - the procedural recipe is not re-run after baking.
+
+Most chunks are **ephemeral**: they are generated on demand from the procedural list and discarded when out of range. Only persistent chunks are stored on disk.
+
+When a new procedural edit is added whose bounding volume overlaps an existing persistent chunk, it is applied immediately to that chunk's ESVC using the shape edit API. Player voxels outside the op's coverage are untouched. The op is also appended to the procedural list so future ephemeral chunk generation includes it. Order semantics are append-only: retroactive ops apply on top of current chunk state rather than re-running the full list, so they should logically follow everything already in the list (e.g., a cave op added after terrain generation cuts into whatever is already there).
 
 ---
 
@@ -126,7 +134,7 @@ Terrain is generated via noise-based heightmaps with erosion and layered geology
 
 Material transitions between geology layers use a dithered boundary: instead of a hard horizontal cut, each voxel samples `hash(world_pos) < blend_factor(height)` to decide which material it belongs to. This produces natural-looking stochastic transitions at zero memory cost, since the hash is computed on the fly during generation.
 
-Terrain features like caves, boulders, and overhangs are driven by the same parameterized shape API used for edits (spheres, capsules, SDFs), making them first-class citizens of the generation pipeline rather than special cases.
+Terrain features like caves, boulders, and overhangs are driven by the same parameterized shape API, making them entries in the procedural edit list rather than special cases. Each operation is LOD-aware: at coarse levels the operation's resolution parameter skips noise layers and detail passes whose contribution would be sub-voxel at that scale.
 
 ---
 
@@ -136,11 +144,11 @@ LOD is implemented as a cascade of larger chunks, not as partial uploads of a si
 
 A depth-4 chunk covers 256³ voxels with leaf resolution of 1³. A LOD-1 chunk is 4x larger spatially (1024³ coverage) using the same depth-4 structure, so each leaf covers 4³ original voxels. LOD-2 covers 4096³ with each leaf covering 16³ original voxels, and so on.
 
-The 4x scale factor is intentional: the 64-tree's internal levels are already 4x steps (level 0 = 1 voxel, level 1 = 4³, level 2 = 16³, level 3 = 64³). So a LOD-1 leaf corresponds exactly to a level-2 internal node in the original chunk. The representative material for that node is already computed during flush (`node_lod` walks the children and picks the most common material). Building a LOD chunk from a set of full-res chunks is just lifting their level-2 nodes out and using them as leaves - no fresh downsampling pass needed.
+The 4x scale factor is intentional: the 64-tree's internal levels are already 4x steps (level 0 = 1 voxel, level 1 = 4³, level 2 = 16³, level 3 = 64³). So a LOD-1 leaf corresponds exactly to a level-2 internal node in the original chunk. The representative material for that node is already computed during flush (`node_lod` walks the children and picks the most common material). Building a LOD chunk from its base chunks has two paths depending on whether each base chunk is persistent or ephemeral. For persistent chunks, level-2 nodes are lifted out directly - no recomputation needed. For ephemeral chunks, the procedural edit list is run at LOD-1 resolution: operations apply their coarse-level logic and sub-voxel detail is skipped. The two paths produce compatible node data and are merged into a single LOD ESVC.
 
-When an edited chunk is re-flushed, the LOD chunk covering that region is rebuilt from the updated full-res SVDAG.
+When a persistent chunk is re-flushed, the LOD chunk covering that region is rebuilt from the updated ESVC.
 
-For rendering, the GPU simply traverses the LOD cascade by distance. The existing "no uploaded children → shade a solid cube" fallback applies here too: distant chunks are LOD chunks, which are already coarse SVDAGs with the same structure as any other chunk.
+For rendering, the GPU simply traverses the LOD cascade by distance. The existing "no uploaded children → shade a solid cube" fallback applies here too: distant chunks are LOD chunks, which are already coarse ESVCs with the same structure as any other chunk.
 
 ---
 
@@ -158,6 +166,7 @@ For rendering, the GPU simply traverses the LOD cascade by distance. The existin
 | [Voxelis Bible](https://github.com/WildPixelGames/voxelis) | SVO-DAG deep dive: batching, CoW, SoA, LOD, hash consing. |
 | [Amanatides & Woo DDA](http://www.cse.yorku.ca/~amana/research/grid.pdf) | The DDA algorithm for voxel ray traversal. |
 | [Compressing color data for voxels (Dolonius 2017)](https://dl.acm.org/doi/10.1145/3023368.3023381) | DFS-order color arrays, block compression for SVDAG attributes. |
+| [Fast and Gorgeous Erosion Filter](https://blog.runevision.com/2026/03/fast-and-gorgeous-erosion-filter.html) | Per-point erosion filter (no simulation). Evaluates in isolation, LOD-friendly, outputs height + derivatives + ridge map. |
 
 ### Channels
 
