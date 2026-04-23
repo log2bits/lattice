@@ -5,7 +5,7 @@
 /// bit      3: emissive
 /// bit      2: metallic
 /// bit      1: transparent
-/// bit      0: reserved
+/// bit      0: textured
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Voxel(u32);
@@ -17,6 +17,7 @@ impl Voxel {
 		emissive: bool,
 		metallic: bool,
 		transparent: bool,
+		textured: bool,
 	) -> Self {
 		let r = (rgb[0] as u32) << 24;
 		let g = (rgb[1] as u32) << 16;
@@ -25,6 +26,7 @@ impl Voxel {
 		let e = if emissive { 1 << 3 } else { 0 };
 		let m = if metallic { 1 << 2 } else { 0 };
 		let t = if transparent { 1 << 1 } else { 0 };
+		let tex = if textured { 1 } else { 0 };
 		Voxel(r | g | b | rough | e | m | t)
 	}
 
@@ -50,6 +52,10 @@ impl Voxel {
 
 	pub fn transparent(self) -> bool {
 		(self.0 >> 1) & 1 != 0
+	}
+
+	pub fn textured(self) -> bool {
+		self.0 & 1 != 0
 	}
 }
 

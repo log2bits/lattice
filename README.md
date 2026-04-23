@@ -16,18 +16,18 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ### Storage
 
-1. Each chunk is an ESVC (Efficient Sparse Voxel Contree): a sparse 64-tree (not an octree) where nodes encode 64 children instead of 8, cutting per-voxel overhead
-2. A `terminal_mask` per node marks subtrees that terminate early (uniform material), avoiding unnecessary descent
-3. `materials` is fully packed with one entry per occupied slot and does double duty: terminal slots store the exact uniform material, non-terminal slots store the LOD representative. One array, no separate LOD field, no gaps.
-4. `node_children` and `materials` share a single `children_offset` with lock-step indexing. Terminal slots in `node_children` hold zero; only non-terminal slots carry child indices
-5. Per-chunk material tables deduplicate on the full 32-bit voxel value
-6. Bitpacked widths are powers of 2 and scale with content: 4 bits for ≤16 materials, 8 for ≤256, etc.
+1. Both the world and each chunk use the same sparse 64-tree structure (`Tree`). The world tree (28 levels deep) stores chunk pool handles at its leaves; chunk trees (4 levels deep) store material indices. Same traversal algorithm, same flat SoA layout, same GPU buffers.
+2. A `terminal_mask` per node marks subtrees that terminate early (uniform value), avoiding unnecessary descent
+3. `values` is fully packed with one entry per occupied slot and does double duty: terminal slots store the exact uniform value, non-terminal slots store the LOD representative. One array, no separate LOD field, no gaps.
+4. `node_children` and `values` share a single `children_offset` with lock-step indexing. Terminal slots in `node_children` hold zero; only non-terminal slots carry child indices
+5. Per-chunk material tables deduplicate on the full 32-bit voxel value. The world tree has no material table since its values are chunk handles, not materials.
+6. Bitpacked widths are powers of 2 and scale with content: 4 bits for ≤16 values, 8 for ≤256, etc.
 7. SoA layout per level: GPU warps reading one field across many nodes hit contiguous memory
 8. Chunk levels stored top-down (coarsest first) so partial file reads for LOD can stop early
 
 ### Editing
 
-1. Edits are queued and flushed in batches each frame
+1. Edits are queued in per-chunk pending lists and flushed each frame within a time budget. Dirty chunks are processed closest-camera-first so edits near the player resolve immediately even when many chunks are queued. Large imports (MagicaVoxel models, terrain edits) scatter voxels to chunk buckets automatically and drain over as many frames as needed.
 2. Edit-aware partial rebuild: sort edits by tree-order key, then walk top-down. For each node, find which children have at least one edit in their address range. Children with no edits are copied by index unchanged. Children with edits are recursed into, producing new nodes appended to the existing level arrays. Cost is O(depth × edits).
 3. Terminal subtrees are always copied by index, never expanded to individual voxels.
 4. New nodes are appended and old orphans are left in place during the walk, then swept in the compaction pass.
@@ -35,23 +35,37 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ### Shape Editing
 
-Individual voxel edits are just one case. The edit walk generalizes to any shape with an AABB test:
+Individual voxel edits are just one case. The edit walk generalizes to any shape implementing the `Shape` trait:
+
+```rs
+pub trait Shape: Send + Sync {
+    fn aabb(&self) -> Aabb;
+    fn coverage(&self, node_aabb: Aabb, level: u8) -> Coverage;
+}
+
+pub enum Coverage {
+    Full(Voxel),  // fill subtree, stop recursing
+    Partial,      // recurse into children
+    Empty,        // skip entirely
+}
+```
 
 - **Full coverage** (node AABB entirely inside shape): set subtree to terminal with the fill material, no recursion
 - **No coverage** (node AABB entirely outside shape): copy subtree unchanged, no recursion
 - **Partial coverage**: recurse into children
 
-This gives O(surface area) cost for any shape - a 64³ rectangular fill touches a handful of border nodes rather than 262k individual voxels. Works for rectangles, spheres, capsules, or any SDF. Heightmap terrain generation is a column-wise variant of the same walk.
+This gives O(surface area) cost for any shape - a 64³ rectangular fill touches a handful of border nodes rather than 262k individual voxels. Works for rectangles, spheres, capsules, or any SDF. Heightmap terrain generation is a column-wise variant of the same walk. At leaf level `coverage` is called per-voxel, so multi-material shapes (terrain geology layers, dithered boundaries) return different `Full(material)` values based on position.
 
 ### Rendering
 
 1. Rendered with ray tracing + beam optimization
 2. Partial tree upload: CPU sends only the top N levels per chunk to VRAM based on camera distance
-3. LOD cutoff: when a node has no uploaded children, the GPU reads `materials[child_idx]` on the current node and renders a solid cube instead of descending
+3. LOD cutoff: when a node has no uploaded children, the GPU reads `values[child_idx]` on the current node and renders a solid cube instead of descending
 4. Traversal uses an ancestor stack caching parent node indices, so stepping into neighbor cells doesn't restart from root
 5. Coarse occupancy groups the 64-bit mask into 8 regions of 2×2×2, enabling 8-cell skips over empty space
 6. Coordinate flipping maps all rays into the negative octant, halving branch count in the DDA inner loop
 7. Camera position is stored as integer chunk coordinates plus a chunk-local `vec3` offset always within `[0, 256]` voxels. All ray traversal happens in chunk-local space: when a ray exits a chunk the integer chunk coords are stepped and the ray origin is re-expressed relative to the new chunk. No large floats ever enter the traversal math, so f32 is sufficient for local coordinates regardless of world size.
+8. CPU traversal runs the same DDA algorithm for hit-testing: placing a shape traces a ray from the camera through the world and chunk trees to find the exact hit position in world voxel coordinates.
 
 ### Later (path tracing)
 
@@ -76,35 +90,68 @@ bit   0     reserved
 
 ---
 
-## Level
+## Tree
+
+The core data structure. Used for both the world tree and every chunk tree.
 
 ```rs
+pub struct Tree {
+    pub root: u32,
+    pub levels: Vec<Level>,
+}
+
 pub struct Level {
     pub occupancy_mask: Vec<u64>,
     pub terminal_mask: Vec<u64>,
     pub children_offset: Vec<u32>,
     pub node_children: BitpackedArray,
-    pub materials: BitpackedArray,
+    pub values: BitpackedArray,
 }
 ```
 
 `occupancy_mask`: which of 64 slots are occupied per node.
 
-`terminal_mask`: which occupied slots terminate here. If set, `materials[child_idx]` is the material. If unset, `node_children[child_idx]` is the child node index to descend into.
+`terminal_mask`: which occupied slots terminate here. If set, `values[child_idx]` is the terminal value. If unset, `node_children[child_idx]` is the child node index to descend into.
 
 `children_offset`: start of this node's child block in both arrays. Child index = `children_offset[node] + popcount(occupancy_mask & ((1 << slot) - 1))`.
 
-`materials`: fully packed, one entry per occupied slot. Unified across all levels - at the leaf level these are the actual voxel colors; at higher levels they are the LOD representative for that subtree. Terminal slots hold the exact uniform material (which is also the LOD). Non-terminal slots hold the most common material among the children's `materials` entries, computed bottom-up during construction. Ties go to the first material. This means edits that don't change the dominant material in a subtree don't propagate LOD changes all the way up the tree. No zeros, no gaps.
+`values`: fully packed, one entry per occupied slot. Terminal slots hold the leaf value. Non-terminal slots hold the LOD representative (most common value among children, computed bottom-up). No zeros, no gaps.
 
-`node_children`: lock-step with `materials`. Non-terminal slots hold child node indices; terminal slots hold zero.
+`node_children`: lock-step with `values`. Non-terminal slots hold child node indices; terminal slots hold zero. Empty at the leaf level.
 
-At the leaf level all slots are terminal and `node_children` is empty - it carries no data.
+---
+
+## Chunk Tree
+
+A depth-4 `Tree` covering 256³ voxels. Chunk depth is fixed - depth-4 is the only chunk size used at every LOD level. Positions within a chunk are always `[u8; 3]` (each component 0-255), keeping chunk-local math cheap and free of range checks. World-space positions use `[i64; 3]` only when crossing chunk boundaries.
+
+Terminal `values` are indices into a per-chunk `MaterialTable` (a deduplicated list of 32-bit voxel values). The `MaterialTable` lives alongside the tree, not inside it.
+
+```rs
+pub const DEPTH: u8 = 4;
+pub const SIDE: u32 = 256; // 4^DEPTH
+
+pub struct Chunk {
+    pub tree: Tree,
+    pub materials: MaterialTable,
+}
+```
+
+---
+
+## World Tree
+
+A depth-28 `Tree` covering the full 2^64 voxel world. Terminal `values` are chunk pool handles (u32 index into `ChunkPool`; `u32::MAX` = empty). No material table.
+
+Tree depth encodes LOD: a leaf at depth 28 is a LOD-0 chunk (256³ voxels, 1³ per leaf voxel). A leaf at depth 20 is a LOD-8 chunk (the same depth-4 ESVC structure, but each leaf voxel covers 4^8 original voxels). The world tree is maintained by the CPU LOD system using a points-of-interest walk; see the LOD section.
+
+GPU ray traversal descends the world tree using the same DDA and ancestor stack as per-chunk traversal. On hitting a terminal node, the shader reads the chunk handle, looks up its byte offset in the chunk offset table, and continues traversal in that chunk's tree. Both trees use the same flat SoA buffers, so no structural switch is needed mid-ray.
 
 ---
 
 ## Tree Construction
 
-Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same material, the group collapses to a single terminal entry in the parent - no node is allocated.
+Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same value, the group collapses to a single terminal entry in the parent - no node is allocated.
 
 After construction, a compaction pass rebuilds each level's arrays from scratch containing only reachable nodes, removing orphans left by partial rebuilds.
 
@@ -112,17 +159,35 @@ After construction, a compaction pass rebuilds each level's arrays from scratch 
 
 ## World
 
-Chunks are stored in a hashmap keyed on integer (x, y, z) chunk coordinates, expanding lazily as the player explores. No cross-chunk node sharing - this would break per-chunk LOD streaming. At depth 4 each chunk covers 256³ voxels.
+The world owns a `WorldTree` (depth-28 `Tree`), a `ChunkPool` (flat pool of loaded chunks indexed by u32 handle), a shape edit list, and a map of persistent chunks.
+
+```rs
+pub struct World {
+    pub world_tree: Tree,
+    pub pool: ChunkPool,
+    pub shape_edits: Vec<ShapeEdit>,
+    pub persistent_chunks: HashMap<[i64; 3], Chunk>,
+    rebuild_pending: Vec<[i64; 3]>,  // chunks with pending voxel edits, sorted closest-first
+}
+
+pub struct ShapeEdit {
+    pub aabb: Aabb,   // cached from shape.aabb() for O(1) per-chunk rejection
+    pub min_lod: u8,
+    pub shape: Box<dyn Shape>,
+}
+```
+
+No cross-chunk node sharing - this would break per-chunk LOD streaming.
 
 There are two distinct edit types:
 
-**Procedural edits** (terrain, caves, boulders, etc.) are stored as a global ordered list of parameterized operations. Each operation has a bounding volume and a resolution level parameter. When any chunk is generated, the list is spatially queried for overlapping ops and they are applied in order using the shape edit API. At coarser LOD levels, operations skip sub-voxel detail: a high-frequency noise layer that produces centimeter-scale variation contributes nothing to a LOD chunk whose voxels are meters wide, so it is culled by level. The list is the authoritative world recipe and is always re-runnable.
+**Shape edits** (terrain, caves, boulders, etc.) are stored as a global ordered list of `ShapeEdit` entries. Each entry stores a tight axis-aligned bounding box in world voxel coordinates, a minimum LOD level, and a boxed `Shape`. When generating a chunk, the list is filtered by AABB overlap before invoking any shape logic - for flat terrain whose AABB has a small Y range, sky chunks are rejected with a single comparison. The list is the authoritative world recipe and is always re-runnable. For large edit counts the list can be indexed with a BVH for O(log n) per-chunk queries.
 
-**Voxel edits** are individual voxel writes from player interaction. These are not stored as a log. Instead, the first voxel edit to a chunk triggers creation of a **persistent chunk**: the full procedural content is baked at that point, the voxel edit is applied on top, and the resulting ESVC is stored permanently. Subsequent voxel edits to that chunk use the existing partial-rebuild machinery directly on the stored ESVC. The ESVC is the ground truth - the procedural recipe is not re-run after baking.
+**Voxel edits** are individual voxel writes from player interaction. These are not stored as a log. Instead, the first voxel edit to a chunk triggers creation of a **persistent chunk**: the full shape edit content is baked at that point, the voxel edit is applied on top, and the resulting tree is stored permanently. Subsequent voxel edits to that chunk use the existing partial-rebuild machinery directly on the stored tree. The tree is the ground truth - the shape edit list is not re-run after baking.
 
-Most chunks are **ephemeral**: they are generated on demand from the procedural list and discarded when out of range. Only persistent chunks are stored on disk.
+Most chunks are **ephemeral**: generated on demand from the shape edit list and discarded when out of range. Only persistent chunks are stored on disk.
 
-When a new procedural edit is added whose bounding volume overlaps an existing persistent chunk, it is applied immediately to that chunk's ESVC using the shape edit API. Player voxels outside the op's coverage are untouched. The op is also appended to the procedural list so future ephemeral chunk generation includes it. Order semantics are append-only: retroactive ops apply on top of current chunk state rather than re-running the full list, so they should logically follow everything already in the list (e.g., a cave op added after terrain generation cuts into whatever is already there).
+When a new shape edit is added whose AABB overlaps an existing persistent chunk, it is applied immediately to that chunk's tree. Player voxels outside the shape's coverage are untouched. The edit is also appended to the shape edit list so future ephemeral chunk generation includes it.
 
 ---
 
@@ -134,21 +199,47 @@ Terrain is generated via noise-based heightmaps with erosion and layered geology
 
 Material transitions between geology layers use a dithered boundary: instead of a hard horizontal cut, each voxel samples `hash(world_pos) < blend_factor(height)` to decide which material it belongs to. This produces natural-looking stochastic transitions at zero memory cost, since the hash is computed on the fly during generation.
 
-Terrain features like caves, boulders, and overhangs are driven by the same parameterized shape API, making them entries in the procedural edit list rather than special cases. Each operation is LOD-aware: at coarse levels the operation's resolution parameter skips noise layers and detail passes whose contribution would be sub-voxel at that scale.
+Terrain features like caves, boulders, and overhangs are driven by the same `Shape` API, making them entries in the shape edit list rather than special cases. Each shape is LOD-aware: at coarse levels the `coverage` implementation skips noise layers and detail passes whose contribution would be sub-voxel at that scale.
 
 ---
 
 ## LOD
 
-LOD is implemented as a cascade of larger chunks, not as partial uploads of a single tree.
+LOD is implemented as a cascade of chunks where every LOD level uses the same depth-4 ESVC structure. Every chunk in memory is identical in format regardless of LOD level: a depth-4 64-tree with 256³ leaf slots. What changes between LOD levels is only the physical size of each leaf voxel. This mirrors the approach in Aokana (2505.02017), which uses uniform chunk resolution across all LOD levels, but with a 64-tree instead of an octree.
 
-A depth-4 chunk covers 256³ voxels with leaf resolution of 1³. A LOD-1 chunk is 4x larger spatially (1024³ coverage) using the same depth-4 structure, so each leaf covers 4³ original voxels. LOD-2 covers 4096³ with each leaf covering 16³ original voxels, and so on.
+A LOD-0 chunk covers 256³ world voxels, each leaf = 1³ voxels. A LOD-1 chunk covers 1024³ world voxels using the same depth-4 structure, each leaf = 4³ original voxels. LOD-2 covers 4096³, each leaf = 16³ original voxels, and so on. Coverage grows as 256 × 4^k per side at LOD-k, reaching 2^64 at LOD-28.
 
-The 4x scale factor is intentional: the 64-tree's internal levels are already 4x steps (level 0 = 1 voxel, level 1 = 4³, level 2 = 16³, level 3 = 64³). So a LOD-1 leaf corresponds exactly to a level-2 internal node in the original chunk. The representative material for that node is already computed during flush (`node_lod` walks the children and picks the most common material). Building a LOD chunk from its base chunks has two paths depending on whether each base chunk is persistent or ephemeral. For persistent chunks, level-2 nodes are lifted out directly - no recomputation needed. For ephemeral chunks, the procedural edit list is run at LOD-1 resolution: operations apply their coarse-level logic and sub-voxel detail is skipped. The two paths produce compatible node data and are merged into a single LOD ESVC.
+The 4x scale factor per level (vs Aokana's 2x octree factor) means only 28 LOD levels are needed to span a 2^64 voxel world, instead of 56.
+
+**Construction**: a LOD-k chunk is built by aggregating 64 LOD-(k-1) chunks, exactly as Aokana aggregates 8 octree chunks, but with 64 children instead of 8. Each output leaf samples 64 input leaves from the corresponding LOD-(k-1) chunks. A voxel is filled if the number of non-empty input voxels meets a density threshold, and the output color is the average of non-empty inputs. For persistent chunks there is a shortcut: level-2 nodes (which cover exactly 4³ original voxels) are lifted directly out of the existing ESVC without recomputation. For ephemeral chunks the shape edit list is re-run at LOD-k resolution, skipping sub-voxel detail.
 
 When a persistent chunk is re-flushed, the LOD chunk covering that region is rebuilt from the updated ESVC.
 
-For rendering, the GPU simply traverses the LOD cascade by distance. The existing "no uploaded children → shade a solid cube" fallback applies here too: distant chunks are LOD chunks, which are already coarse ESVCs with the same structure as any other chunk.
+**World tree LOD maintenance**: The CPU walks the world tree top-down each frame to enforce a simple invariant: the only non-terminal paths are those leading directly to an active point of interest. Every other occupied slot must be a terminal chunk. Any non-terminal child that no point of interest passes through is marked for consolidation: its subtree is collapsed into a single coarser LOD chunk and replaced with a terminal entry.
+
+A point of interest has a world position and a max depth. The camera is always a point of interest at max depth 28 (full LOD-0 resolution). A spyglass or scoped weapon adds a second point of interest at its target position, also at max depth 28, active only while in use. Any game object can register as a point of interest with whatever max depth gives sufficient detail at that range. When a point of interest is added or moves into a new cell, the terminal chunk on its path is split down to the required depth. When it is removed or moves away, the now-orphaned non-terminal path is consolidated.
+
+For rendering, the GPU traverses the world tree and chunk trees continuously. Distant regions are LOD chunks with the same tree structure as any other chunk, just coarser leaves.
+
+---
+
+## GPU Memory
+
+The GPU needs four things: scene metadata (camera position, sun direction, etc.), the world tree, a chunk offset table, and chunk data.
+
+**Chunk data buffer**: A single large `storage<read>` buffer holding all chunk trees packed end-to-end. Managed as a Vec-style allocator: new chunks append to the end, removed chunks leave holes tracked in a CPU-side free list. The buffer grows with a doubling strategy only when live data exceeds its current size, so a small world uses small VRAM. When fragmentation exceeds a threshold, a GPU-side compaction pass runs: `copy_buffer_to_buffer` packs live chunks together, then a compute shader updates the offset table. Compaction runs at GPU memory bandwidth (200-400 GB/s on mid-range hardware), not PCIe bandwidth, so shifting 500 MB takes ~2 ms.
+
+**Chunk offset table**: A `u32` array, one entry per pool handle. `chunk_offsets[handle]` is the byte offset of that chunk's data in the chunk data buffer. The world tree stores handles; the shader does one extra read to convert handle → offset before descending into the chunk tree.
+
+**Uploads**: Edited chunks are re-uploaded in full (typically 200 KB - 1 MB each). The world tree is ~10-20 KB for a few thousand loaded chunks and is re-uploaded in full whenever the loaded set changes. Both are cheap relative to the per-frame render budget.
+
+**Shader bindings**:
+```wgsl
+@group(0) @binding(0) var<storage, read> world_tree:    array<u32>;
+@group(0) @binding(1) var<storage, read> chunk_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read> chunk_data:    array<u32>;
+```
+When a ray hits a terminal node in the world tree with handle `h`, it reads `chunk_offsets[h]` and jumps to `chunk_data[chunk_offsets[h]]` to continue traversal. One extra memory read per chunk boundary crossing.
 
 ---
 
