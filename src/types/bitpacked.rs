@@ -48,12 +48,22 @@ impl BitpackedArray {
 
 	#[inline]
 	pub fn get(&self, index: u32) -> u32 {
+		debug_assert!(
+			index < self.len,
+			"index {index} out of bounds (len={})",
+			self.len
+		);
 		let bit_pos = index << self.bits.trailing_zeros();
 		(self.data[(bit_pos >> 5) as usize] >> (bit_pos & 31)) & Self::mask(self.bits)
 	}
 
 	#[inline]
 	pub fn set(&mut self, index: u32, value: u32) {
+		debug_assert!(
+			index < self.len,
+			"index {index} out of bounds (len={})",
+			self.len
+		);
 		self.ensure_width(value);
 		let bit_pos = index << self.bits.trailing_zeros();
 		let bit_off = bit_pos & 31;

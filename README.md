@@ -17,9 +17,9 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 ### Storage
 
 1. Both the world and each chunk use the same sparse 64-tree structure (`Tree`). The world tree (28 levels deep) stores chunk pool handles at its leaves; chunk trees (4 levels deep) store material indices. Same traversal algorithm, same flat SoA layout, same GPU buffers.
-2. A `terminal_mask` per node marks subtrees that terminate early (uniform value), avoiding unnecessary descent
-3. `values` is fully packed with one entry per occupied slot and does double duty: terminal slots store the exact uniform value, non-terminal slots store the LOD representative. One array, no separate LOD field, no gaps.
-4. `node_children` and `values` share a single `children_offset` with lock-step indexing. Terminal slots in `node_children` hold zero; only non-terminal slots carry child indices
+2. A `leaf_mask` per node marks subtrees that are leaves (uniform value), avoiding unnecessary descent
+3. `values` is fully packed with one entry per occupied slot and does double duty: leaf slots store the exact uniform value, non-leaf slots store the LOD representative. One array, no separate LOD field, no gaps.
+4. `node_children` and `values` share a single `children_offset` with lock-step indexing. Leaf slots in `node_children` hold zero; only non-leaf slots carry child indices
 5. Per-chunk material tables deduplicate on the full 32-bit voxel value. The world tree has no material table since its values are chunk handles, not materials.
 6. Bitpacked widths are powers of 2 and scale with content: 4 bits for ≤16 values, 8 for ≤256, etc.
 7. SoA layout per level: GPU warps reading one field across many nodes hit contiguous memory
@@ -50,7 +50,7 @@ pub enum Coverage {
 }
 ```
 
-- **Full coverage** (node AABB entirely inside shape): set subtree to terminal with the fill material, no recursion
+- **Full coverage** (node AABB entirely inside shape): set subtree to a leaf with the fill material, no recursion
 - **No coverage** (node AABB entirely outside shape): copy subtree unchanged, no recursion
 - **Partial coverage**: recurse into children
 
@@ -102,7 +102,7 @@ pub struct Tree {
 
 pub struct Level {
     pub occupancy_mask: Vec<u64>,
-    pub terminal_mask: Vec<u64>,
+    pub leaf_mask: Vec<u64>,
     pub children_offset: Vec<u32>,
     pub node_children: BitpackedArray,
     pub values: BitpackedArray,
@@ -111,13 +111,13 @@ pub struct Level {
 
 `occupancy_mask`: which of 64 slots are occupied per node.
 
-`terminal_mask`: which occupied slots terminate here. If set, `values[child_idx]` is the terminal value. If unset, `node_children[child_idx]` is the child node index to descend into.
+`leaf_mask`: which occupied slots are leaves. If set, `values[child_idx]` is the leaf value. If unset, `node_children[child_idx]` is the child node index to descend into.
 
 `children_offset`: start of this node's child block in both arrays. Child index = `children_offset[node] + popcount(occupancy_mask & ((1 << slot) - 1))`.
 
-`values`: fully packed, one entry per occupied slot. Terminal slots hold the leaf value. Non-terminal slots hold the LOD representative (most common value among children, computed bottom-up). No zeros, no gaps.
+`values`: fully packed, one entry per occupied slot. Leaf slots hold the leaf value. Non-leaf slots hold the LOD representative (most common value among children, computed bottom-up). No zeros, no gaps.
 
-`node_children`: lock-step with `values`. Non-terminal slots hold child node indices; terminal slots hold zero. Empty at the leaf level.
+`node_children`: lock-step with `values`. Non-leaf slots hold child node indices; leaf slots hold zero. Empty at the leaf level.
 
 ---
 
@@ -151,7 +151,7 @@ GPU ray traversal descends the world tree using the same DDA and ancestor stack 
 
 ## Tree Construction
 
-Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same value, the group collapses to a single terminal entry in the parent - no node is allocated.
+Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same value, the group collapses to a single leaf entry in the parent - no node is allocated.
 
 After construction, a compaction pass rebuilds each level's arrays from scratch containing only reachable nodes, removing orphans left by partial rebuilds.
 
@@ -215,9 +215,9 @@ The 4x scale factor per level (vs Aokana's 2x octree factor) means only 28 LOD l
 
 When a persistent chunk is re-flushed, the LOD chunk covering that region is rebuilt from the updated ESVC.
 
-**World tree LOD maintenance**: The CPU walks the world tree top-down each frame to enforce a simple invariant: the only non-terminal paths are those leading directly to an active point of interest. Every other occupied slot must be a terminal chunk. Any non-terminal child that no point of interest passes through is marked for consolidation: its subtree is collapsed into a single coarser LOD chunk and replaced with a terminal entry.
+**World tree LOD maintenance**: The CPU walks the world tree top-down each frame to enforce a simple invariant: the only non-leaf paths are those leading directly to an active point of interest. Every other occupied slot must be a leaf chunk. Any non-leaf child that no point of interest passes through is marked for consolidation: its subtree is collapsed into a single coarser LOD chunk and replaced with a leaf entry.
 
-A point of interest has a world position and a max depth. The camera is always a point of interest at max depth 28 (full LOD-0 resolution). A spyglass or scoped weapon adds a second point of interest at its target position, also at max depth 28, active only while in use. Any game object can register as a point of interest with whatever max depth gives sufficient detail at that range. When a point of interest is added or moves into a new cell, the terminal chunk on its path is split down to the required depth. When it is removed or moves away, the now-orphaned non-terminal path is consolidated.
+A point of interest has a world position and a max depth. The camera is always a point of interest at max depth 28 (full LOD-0 resolution). A spyglass or scoped weapon adds a second point of interest at its target position, also at max depth 28, active only while in use. Any game object can register as a point of interest with whatever max depth gives sufficient detail at that range. When a point of interest is added or moves into a new cell, the leaf chunk on its path is split down to the required depth. When it is removed or moves away, the now-orphaned non-leaf path is consolidated.
 
 For rendering, the GPU traverses the world tree and chunk trees continuously. Distant regions are LOD chunks with the same tree structure as any other chunk, just coarser leaves.
 
@@ -239,7 +239,7 @@ The GPU needs four things: scene metadata (camera position, sun direction, etc.)
 @group(0) @binding(1) var<storage, read> chunk_offsets: array<u32>;
 @group(0) @binding(2) var<storage, read> chunk_data:    array<u32>;
 ```
-When a ray hits a terminal node in the world tree with handle `h`, it reads `chunk_offsets[h]` and jumps to `chunk_data[chunk_offsets[h]]` to continue traversal. One extra memory read per chunk boundary crossing.
+When a ray hits a leaf node in the world tree with handle `h`, it reads `chunk_offsets[h]` and jumps to `chunk_data[chunk_offsets[h]]` to continue traversal. One extra memory read per chunk boundary crossing.
 
 ---
 

@@ -6,7 +6,7 @@ pub use rect::Rect;
 pub use sphere::Sphere;
 pub use terrain::Terrain;
 
-use crate::{tree::Aabb, voxel::Voxel};
+use crate::{tree::Aabb, types::Voxel};
 
 pub enum Coverage {
 	Full(Voxel),

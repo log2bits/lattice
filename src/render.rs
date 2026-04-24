@@ -19,7 +19,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-	pub async fn new(window: std::sync::Arc<winit::window::Window>) -> Self { todo!() }
-	pub fn render(&mut self, world: &World, camera: &CameraPos) { todo!() }
-	pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) { todo!() }
+	pub async fn new(window: std::sync::Arc<winit::window::Window>) -> Self {
+		todo!()
+	}
+	pub fn render(&mut self, world: &World, camera: &CameraPos) {
+		todo!()
+	}
+	pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+		todo!()
+	}
 }
