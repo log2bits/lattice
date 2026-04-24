@@ -27,11 +27,12 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ### Editing
 
-1. Edits are queued in per-chunk pending lists and flushed each frame within a time budget. Dirty chunks are processed closest-camera-first so edits near the player resolve immediately even when many chunks are queued. Large imports (MagicaVoxel models, terrain edits) scatter voxels to chunk buckets automatically and drain over as many frames as needed.
-2. Edit-aware partial rebuild: sort edits by tree-order key, then walk top-down. For each node, find which children have at least one edit in their address range. Children with no edits are copied by index unchanged. Children with edits are recursed into, producing new nodes appended to the existing level arrays. Cost is O(depth × edits).
-3. Terminal subtrees are always copied by index, never expanded to individual voxels.
-4. New nodes are appended and old orphans are left in place during the walk, then swept in the compaction pass.
-5. Compact after each flush - rebuilds level arrays with only reachable nodes, removing orphans left by partial rebuilds.
+1. Each chunk owns an `OrderedEdits`: an ordered list of `EditPacket`s applied sequentially. Later packets overwrite earlier ones. Each packet holds a `Vec<Edit>` and a `sorted` flag.
+2. Shape edits (terrain, caves, etc.) produce pre-sorted packets from the coverage walk and are appended via `add_shape_packet`. Player voxel edits are appended to the last unsorted packet, or start a new one if the last packet is sorted. This preserves shape-vs-player ordering without merging the two streams.
+3. `Edit` carries a position (`[u64; 3]`), a level (`0` = single voxel, `n` = 4^n voxel cube), and an optional value (`None` = remove). Level > 0 lets shape edits collapse entire uniform subtrees without expanding to individual voxels.
+4. `flush_edits` sorts any unsorted packets by Morton key, then applies all packets to the tree in order. Cost is O(depth × edits) per packet.
+5. Edit walk is top-down: for each node, find children with edits in their range. Children with no edits are copied unchanged. Children with edits are recursed into, producing new nodes appended to the level arrays.
+6. Compact after each flush - rebuilds level arrays with only reachable nodes, removing orphans.
 
 ### Shape Editing
 
@@ -151,9 +152,7 @@ GPU ray traversal descends the world tree using the same DDA and ancestor stack 
 
 ## Tree Construction
 
-Built bottom-up from tree-order sorted voxels. Leaf nodes first, then parents from groups of 64 children. If all 64 children share the same value, the group collapses to a single leaf entry in the parent - no node is allocated.
-
-After construction, a compaction pass rebuilds each level's arrays from scratch containing only reachable nodes, removing orphans left by partial rebuilds.
+Trees start empty and grow entirely through `apply_edits(OrderedEdits)`. There is no separate build path: initial generation, player edits, LOD aggregation, and voxel imports all go through the same edit system. A voxel import is just an empty tree with the imported voxels applied as an unsorted `EditPacket`.
 
 ---
 
@@ -166,8 +165,12 @@ pub struct World {
     pub world_tree: Tree,
     pub pool: ChunkPool,
     pub shape_edits: Vec<ShapeEdit>,
-    pub persistent_chunks: HashMap<[i64; 3], Chunk>,
-    rebuild_pending: Vec<[i64; 3]>,  // chunks with pending voxel edits, sorted closest-first
+    pub persistent_chunks: HashMap<[i64; 3], PersistentChunk>,
+}
+
+pub enum PersistentChunk {
+    Resident(Chunk), // in CPU memory; out of LOD-0 range, not in pool
+    Active(u32),     // handle into pool; chunk lives there at full resolution
 }
 
 pub struct ShapeEdit {
@@ -178,6 +181,8 @@ pub struct ShapeEdit {
 ```
 
 No cross-chunk node sharing - this would break per-chunk LOD streaming.
+
+`PersistentChunk::Active` means the chunk is in the pool at full (LOD-0) resolution with no duplication: the pool slot IS the persistent chunk, and the map just holds its handle. When the camera moves away and the area coarsens, the chunk is pulled out of the pool into `Resident`, a new derived LOD chunk is built by aggregating it, and that derived chunk takes the pool slot instead. The derived chunk is ephemeral; the `Resident` data remains the ground truth.
 
 There are two distinct edit types:
 
@@ -211,11 +216,13 @@ A LOD-0 chunk covers 256³ world voxels, each leaf = 1³ voxels. A LOD-1 chunk c
 
 The 4x scale factor per level (vs Aokana's 2x octree factor) means only 28 LOD levels are needed to span a 2^64 voxel world, instead of 56.
 
-**Construction**: a LOD-k chunk is built by aggregating 64 LOD-(k-1) chunks, exactly as Aokana aggregates 8 octree chunks, but with 64 children instead of 8. Each output leaf samples 64 input leaves from the corresponding LOD-(k-1) chunks. A voxel is filled if the number of non-empty input voxels meets a density threshold, and the output color is the average of non-empty inputs. For persistent chunks there is a shortcut: level-2 nodes (which cover exactly 4³ original voxels) are lifted directly out of the existing ESVC without recomputation. For ephemeral chunks the shape edit list is re-run at LOD-k resolution, skipping sub-voxel detail.
+**Construction**: a LOD-k chunk is built by aggregating 64 LOD-(k-1) chunks, exactly as Aokana aggregates 8 octree chunks, but with 64 children instead of 8. Each output leaf samples 64 input leaves from the corresponding LOD-(k-1) chunks. A voxel is filled if the number of non-empty input voxels meets a density threshold, and the output color is the average of non-empty inputs. For persistent chunks there is a shortcut: level-2 nodes (which cover exactly 4³ original voxels) are lifted directly out of the existing tree without recomputation. For ephemeral chunks the shape edit list is re-run at LOD-k resolution, skipping sub-voxel detail. In both cases, any persistent chunks whose AABB intersects the target chunk are aggregated in: their trees are walked and their player-placed voxels influence the coarser LOD output.
 
 When a persistent chunk is re-flushed, the LOD chunk covering that region is rebuilt from the updated ESVC.
 
-**World tree LOD maintenance**: The CPU walks the world tree top-down each frame to enforce a simple invariant: the only non-leaf paths are those leading directly to an active point of interest. Every other occupied slot must be a leaf chunk. Any non-leaf child that no point of interest passes through is marked for consolidation: its subtree is collapsed into a single coarser LOD chunk and replaced with a leaf entry.
+**Coarsen and split**: LOD transitions are explicit world-tree operations, not chunk edits. `coarsen_chunk` takes 64 child handles, aggregates them into one new coarser chunk, frees the 64 old pool slots, and returns the new handle. `split_chunk` takes one coarser handle, spawns 64 finer chunks initialized from the parent, frees the parent slot, and returns the 64 new handles. Each new finer chunk is marked for shape resolution to fill in the sub-voxel detail the coarser chunk lacked.
+
+**World tree LOD maintenance**: The CPU walks the world tree top-down each frame to enforce a simple invariant: the only non-leaf paths are those leading directly to an active point of interest. Every other occupied slot must be a leaf chunk. Any non-leaf child that no point of interest passes through is marked for consolidation: its subtree is collapsed via `coarsen_chunk` and replaced with a leaf entry.
 
 A point of interest has a world position and a max depth. The camera is always a point of interest at max depth 28 (full LOD-0 resolution). A spyglass or scoped weapon adds a second point of interest at its target position, also at max depth 28, active only while in use. Any game object can register as a point of interest with whatever max depth gives sufficient detail at that range. When a point of interest is added or moves into a new cell, the leaf chunk on its path is split down to the required depth. When it is removed or moves away, the now-orphaned non-leaf path is consolidated.
 

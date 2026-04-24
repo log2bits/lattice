@@ -1,9 +1,11 @@
-mod build;
 mod compact;
 mod edit;
 mod level;
 mod traverse;
 
+use std::array::from_fn;
+
+pub use edit::{Edit, EditPacket, OrderedEdits};
 pub use level::Level;
 pub use traverse::{Ray, RayHit};
 
@@ -33,31 +35,29 @@ impl Aabb {
 	}
 }
 
-pub struct Tree {
+pub struct Tree<const DEPTH: usize> {
 	pub root: u32,
-	pub levels: Vec<Level>,
+	pub leaf_unit: u64,
+	pub edits: OrderedEdits<DEPTH>,
+	pub levels: [Level; DEPTH],
 }
 
-pub struct Data {
-	pub value: u32,
-	pub level: u8,
-	pub slot: u8,
-}
-
-impl Tree {
-	pub fn with_depth(depth: u8) -> Self {
+impl<const DEPTH: usize> Tree<DEPTH> {
+	pub fn new(leaf_unit: u64) -> Self {
 		Self {
 			root: 0,
-			levels: vec![Level::new(); depth.into()],
+			leaf_unit,
+			edits: Default::default(),
+			levels: from_fn(|_| Level::new()),
 		}
 	}
 
-	pub fn depth(&self) -> u8 {
-		self.levels.len() as u8
+	pub fn depth(&self) -> usize {
+		DEPTH
 	}
 
-	// Side length in leaf voxels: 4^depth.
+	// Side length in leaf voxels: 4^DEPTH.
 	pub fn side_len(&self) -> u32 {
-		4u32.pow(self.depth() as u32)
+		4u32.pow(DEPTH as u32)
 	}
 }

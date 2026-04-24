@@ -1,6 +1,9 @@
-use crate::{tree::Tree, world::ChunkPool};
+use crate::{
+	tree::Tree,
+	world::{ChunkPool, WORLD_DEPTH},
+};
 
-pub fn upload_world_tree(queue: &wgpu::Queue, buf: &wgpu::Buffer, tree: &Tree) {
+pub fn upload_world_tree(queue: &wgpu::Queue, buf: &wgpu::Buffer, tree: &Tree<WORLD_DEPTH>) {
 	todo!()
 }
 

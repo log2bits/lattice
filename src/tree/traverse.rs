@@ -11,7 +11,7 @@ pub struct RayHit {
 	pub value: u32,
 }
 
-impl Tree {
+impl<const DEPTH: usize> Tree<DEPTH> {
 	// DDA traversal with ancestor stack. Returns the first occupied leaf
 	// node hit by the ray and its packed value (material index or chunk handle).
 	pub fn trace(&self, ray: &Ray, bounds: Aabb) -> Option<RayHit> {
