@@ -1,3 +1,4 @@
+#[derive(Default)]
 pub struct Lut<T> {
 	pub values: Vec<T>,
 }

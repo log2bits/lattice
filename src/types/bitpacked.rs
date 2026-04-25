@@ -154,4 +154,12 @@ impl BitpackedArray {
 			(1u32 << bits) - 1
 		}
 	}
+	
+	pub fn truncate(&mut self, new_len: u32) {
+		assert!(new_len <= self.len);
+		self.len = new_len;
+		let new_word_count =
+			((self.len as usize * self.bits as usize) + 31) >> 5;
+		self.data.truncate(new_word_count);
+	}
 }
