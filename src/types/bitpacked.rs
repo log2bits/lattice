@@ -20,6 +20,10 @@ impl BitpackedArray {
 		}
 	}
 
+	pub fn bytes(&self) -> usize {
+		self.data.len() * 4
+	}
+
 	pub fn with_bits(bits: u8) -> Self {
 		assert!(matches!(bits, 1 | 2 | 4 | 8 | 16 | 32));
 		Self {

@@ -18,7 +18,7 @@ impl Shape for Sphere {
 		}
 	}
 
-	fn coverage(&self, node_aabb: Aabb, level: u8) -> Coverage {
+	fn coverage(&self, node_aabb: Aabb, lod: u8) -> Coverage {
 		let radius = self.radius.max(0) as i128;
 		let radius_sq = radius * radius;
 		let sample_max = node_aabb.max.map(|v| v - 1);
@@ -31,7 +31,7 @@ impl Shape for Sphere {
 
 		let max_dist_sq =
 			axis_distance_sq(self.center, node_aabb.min, sample_max, farthest_distance);
-		if max_dist_sq <= radius_sq || level == 0 {
+		if max_dist_sq <= radius_sq || lod == 0 {
 			return Coverage::Full(self.material);
 		}
 

@@ -11,7 +11,7 @@ impl Shape for Rect {
 	fn aabb(&self) -> Aabb {
 		todo!()
 	}
-	fn coverage(&self, node_aabb: Aabb, level: u8) -> Coverage {
+	fn coverage(&self, node_aabb: Aabb, lod: u8) -> Coverage {
 		todo!()
 	}
 }

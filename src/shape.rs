@@ -19,9 +19,8 @@ pub enum Coverage {
 
 pub trait Shape: Send + Sync {
 	fn aabb(&self) -> Aabb;
-	// Given a node's world-space AABB and its depth level, classify coverage.
-	// At leaf level the AABB covers exactly one voxel.
-	fn coverage(&self, node_aabb: Aabb, level: u8) -> Coverage;
+	// lod: 0 = single voxel, n = node covers 4^n voxels per side.
+	fn coverage(&self, node_aabb: Aabb, lod: u8) -> Coverage;
 }
 
 pub fn edit_packet_for_shape<const DEPTH: usize>(
@@ -42,15 +41,7 @@ pub fn edit_packet_for_shape<const DEPTH: usize>(
 	}
 
 	let mut path = [0u8; DEPTH];
-	collect_shape_edits(
-		shape,
-		shape_aabb,
-		root_aabb,
-		DEPTH as u8,
-		0,
-		&mut path,
-		&mut packet,
-	);
+	collect_shape_edits(shape, shape_aabb, root_aabb, 0, &mut path, &mut packet);
 
 	packet
 }
@@ -59,7 +50,6 @@ fn collect_shape_edits<const DEPTH: usize>(
 	shape: &dyn Shape,
 	shape_aabb: Aabb,
 	node_aabb: Aabb,
-	level: u8,
 	depth: usize,
 	path: &mut [u8; DEPTH],
 	packet: &mut EditPacket<DEPTH>,
@@ -68,25 +58,17 @@ fn collect_shape_edits<const DEPTH: usize>(
 		return;
 	}
 
-	match shape.coverage(node_aabb, level) {
+	match shape.coverage(node_aabb, (DEPTH - depth) as u8) {
 		Coverage::Empty => {}
 		Coverage::Full(voxel) => push_shape_edit(path, depth, voxel, packet),
 		Coverage::Partial => {
-			if level == 0 {
-				debug_assert!(
-					false,
-					"shape returned partial coverage at leaf level; leaf coverage must resolve to full or empty"
-				);
-				return;
-			}
-
+			debug_assert!(depth < DEPTH, "partial coverage at leaf level");
 			for slot in 0u8..64 {
 				path[depth] = slot + 1;
 				collect_shape_edits(
 					shape,
 					shape_aabb,
 					node_aabb.split_at_slot(slot as u32),
-					level - 1,
 					depth + 1,
 					path,
 					packet,

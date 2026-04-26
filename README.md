@@ -96,9 +96,11 @@ bit   0     reserved
 The core data structure. Used for both the world tree and every chunk tree.
 
 ```rs
-pub struct Tree {
-    pub root: u32,
-    pub levels: Vec<Level>,
+pub struct Tree<const DEPTH: usize> {
+    pub occupied: bool,  // false = entire tree is empty
+    pub is_leaf: bool,   // true = entire tree is one uniform material (value)
+    pub value: u32,
+    pub levels: [Level; DEPTH],
 }
 
 pub struct Level {
@@ -110,13 +112,17 @@ pub struct Level {
 }
 ```
 
+`occupied/is_leaf/value` represent the root above all levels. When `is_leaf` is false and `occupied` is true, the tree has structure in `levels`.
+
+`levels[0]` holds the root node (one node after compact). Its 64 slot-children live in `levels[1]`. `levels[d]` holds nodes at tree depth `d`; `levels[DEPTH-1]` is the leaf-node level whose slots are individual voxels.
+
 `occupancy_mask`: which of 64 slots are occupied per node.
 
 `leaf_mask`: which occupied slots are leaves. If set, `values[child_idx]` is the leaf value. If unset, `node_children[child_idx]` is the child node index to descend into.
 
 `children_offset`: start of this node's child block in both arrays. Child index = `children_offset[node] + popcount(occupancy_mask & ((1 << slot) - 1))`.
 
-`values`: fully packed, one entry per occupied slot. Leaf slots hold the leaf value. Non-leaf slots hold the LOD representative (most common value among children, computed bottom-up). No zeros, no gaps.
+`values`: fully packed, one entry per occupied slot. Leaf slots hold the leaf value. Non-leaf slots hold the LOD representative (first occupied child's value, bottom-up). No zeros, no gaps.
 
 `node_children`: lock-step with `values`. Non-leaf slots hold child node indices; leaf slots hold zero. Empty at the leaf level.
 

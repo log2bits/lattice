@@ -26,6 +26,21 @@ impl Level {
 		self.occupancy_mask.len() as u32
 	}
 
+	pub fn bytes(&self) -> usize {
+		self.occupancy_mask.len() * 8
+			+ self.leaf_mask.len() * 8
+			+ self.children_offset.len() * 4
+			+ self.node_children.bytes()
+			+ self.values.bytes()
+	}
+
+	// Number of occupied leaf slots across all nodes at this level.
+	pub fn leaf_count(&self) -> u64 {
+		self.occupancy_mask.iter().zip(self.leaf_mask.iter())
+			.map(|(&occ, &leaf)| (occ & leaf).count_ones() as u64)
+			.sum()
+	}
+
 	pub fn child_count(&self, node: u32) -> u32 {
 		self.occupancy_mask[node as usize].count_ones()
 	}
