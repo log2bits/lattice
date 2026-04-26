@@ -5,7 +5,7 @@ mod traverse;
 
 use std::array::from_fn;
 
-pub use edit::{Edit, EditPacket, OrderedEdits};
+pub use edit::{Edit, EditPacket, OrderedEdits, TreePath, DELETE};
 pub use level::Level;
 pub use traverse::{Ray, RayHit};
 
@@ -35,17 +35,24 @@ impl Aabb {
 	}
 }
 
+#[derive(Clone)]
 pub struct Tree<const DEPTH: usize> {
-	pub root: u32,
+	pub occupied: bool,
+	pub is_leaf: bool,
+	pub value: u32,
 	pub leaf_unit: u64,
 	pub edits: OrderedEdits<DEPTH>,
+	// levels[0] = root's children (up to 64 nodes)
+	// levels[d] = nodes at depth d+1 (up to 64^(d+1) nodes)
 	pub levels: [Level; DEPTH],
 }
 
 impl<const DEPTH: usize> Tree<DEPTH> {
 	pub fn new(leaf_unit: u64) -> Self {
 		Self {
-			root: 0,
+			occupied: false,
+			is_leaf: false,
+			value: 0,
 			leaf_unit,
 			edits: Default::default(),
 			levels: from_fn(|_| Level::new()),

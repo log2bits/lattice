@@ -30,6 +30,14 @@ impl Voxel {
 		Voxel(r | g | b | rough | e | m | t)
 	}
 
+	pub fn delete() -> Self {
+		Voxel(u32::MAX)
+	}
+
+	pub fn is_delete(self) -> bool {
+		self.0 == u32::MAX
+	}
+
 	pub fn rgb(self) -> [u8; 3] {
 		[
 			(self.0 >> 24) as u8,

@@ -20,6 +20,15 @@ impl BitpackedArray {
 		}
 	}
 
+	pub fn with_bits(bits: u8) -> Self {
+		assert!(matches!(bits, 1 | 2 | 4 | 8 | 16 | 32));
+		Self {
+			data: Vec::new(),
+			bits,
+			len: 0,
+		}
+	}
+
 	pub fn len(&self) -> u32 {
 		self.len
 	}
@@ -154,12 +163,11 @@ impl BitpackedArray {
 			(1u32 << bits) - 1
 		}
 	}
-	
+
 	pub fn truncate(&mut self, new_len: u32) {
 		assert!(new_len <= self.len);
 		self.len = new_len;
-		let new_word_count =
-			((self.len as usize * self.bits as usize) + 31) >> 5;
+		let new_word_count = ((self.len as usize * self.bits as usize) + 31) >> 5;
 		self.data.truncate(new_word_count);
 	}
 }

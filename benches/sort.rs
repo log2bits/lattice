@@ -1,108 +1,112 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
-use radsort::sort_by_key;
+use criterion::{Criterion, criterion_group, criterion_main};
+use lattice::{
+	chunk,
+	shape::{Sphere, edit_packet_for_shape},
+	tree::{Aabb, EditPacket, TreePath},
+	types::{BitpackedArray, Lut, Voxel},
+};
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 
-use lattice::tree::EditPacket;
-use lattice::types::BitpackedArray;
-
-const DEPTH: usize = 28;
-const N: usize = 50_000;
+const DEPTH: usize = chunk::DEPTH;
 
 struct Data {
-    paths: Vec<[u8; DEPTH]>,
-    levels: Vec<u8>,
-    values: Vec<u32>,
+	paths: Vec<TreePath<DEPTH>>,
+	values: Vec<u32>,
 }
 
 fn generate() -> Data {
-    let mut rng = StdRng::seed_from_u64(42);
+	let mut rng = SmallRng::seed_from_u64(42);
+	let root = Aabb {
+		min: [0, 0, 0],
+		max: [chunk::SIDE as i64; 3],
+	};
+	let sphere = Sphere {
+		center: [128, 128, 128],
+		radius: 100,
+		material: Voxel::from_rgb_flags([95, 88, 80], 13, false, false, false, false),
+	};
+	let packet = edit_packet_for_shape::<DEPTH>(&sphere, root);
 
-    let mut paths = Vec::with_capacity(N);
-    let mut levels = Vec::with_capacity(N);
-    let mut values = Vec::with_capacity(N);
+	let mut edits: Vec<(TreePath<DEPTH>, u32)> = (0..packet.paths.len())
+		.map(|i| {
+			let path = packet.paths[i];
+			let value = packet.lut.get(packet.values.get(i as u32));
+			(path, value)
+		})
+		.collect();
+	edits.shuffle(&mut rng);
 
-    for _ in 0..N {
-        let mut path = [0u8; DEPTH];
-        for d in 0..DEPTH {
-            path[d] = rng.gen_range(0..64);
-        }
+	Data {
+		paths: edits.iter().map(|&(p, _)| p).collect(),
+		values: edits.iter().map(|&(_, v)| v).collect(),
+	}
+}
 
-        paths.push(path);
-        levels.push(rng.gen_range(0..DEPTH as u8));
-        values.push(rng.r#gen::<u32>());
-    }
-
-    Data { paths, levels, values }
+fn make_packet(data: &Data) -> EditPacket<DEPTH> {
+	let mut lut = Lut::new();
+	let mut values = BitpackedArray::new();
+	for &val in &data.values {
+		values.push(lut.get_or_add(val));
+	}
+	EditPacket::<DEPTH> {
+		paths: data.paths.clone(),
+		lut,
+		values,
+		sorted: false,
+	}
 }
 
 fn bench_sort(c: &mut Criterion) {
-    let data = generate();
+	let data = generate();
 
-    c.bench_function("custom_radix", |b| {
-        b.iter(|| {
-            let mut packet = EditPacket::<DEPTH> {
-                paths: data.paths.clone(),
-                levels: data.levels.clone(),
-                lut: Default::default(),
-                values: {
-                    let mut v = BitpackedArray::new();
-                    for &val in &data.values {
-                        v.push(val);
-                    }
-                    v
-                },
-                sorted: false,
-            };
+	// Our implementation.
+	c.bench_function("custom_radix", |b| {
+		b.iter(|| make_packet(&data).sort());
+	});
 
-            packet.sort();
-        });
-    });
+	// Comparison sort on indices using TreePath's derived Ord.
+	c.bench_function("std_sort", |b| {
+		b.iter(|| {
+			let mut idx: Vec<u32> = (0..data.paths.len() as u32).collect();
+			idx.sort_unstable_by(|&a, &b| data.paths[a as usize].cmp(&data.paths[b as usize]));
+			idx
+		});
+	});
 
-    c.bench_function("std_sort", |b| {
-        b.iter(|| {
-            let mut idx: Vec<usize> = (0..data.paths.len()).collect();
+	// Radix sort on indices: u32 keys (28 bits for DEPTH=4) vs u128 keys.
+	c.bench_function("radsort_u32", |b| {
+		b.iter(|| {
+			let mut idx: Vec<u32> = (0..data.paths.len() as u32).collect();
+			radsort::sort_by_key(&mut idx, |&i| pack_key_u32(&data.paths[i as usize]));
+			idx
+		});
+	});
 
-            idx.sort_unstable_by(|&a, &b| {
-                data.paths[a]
-                    .cmp(&data.paths[b])
-                    .then_with(|| data.levels[b].cmp(&data.levels[a]))
-            });
+	c.bench_function("radsort_u128", |b| {
+		b.iter(|| {
+			let mut idx: Vec<u32> = (0..data.paths.len() as u32).collect();
+			radsort::sort_by_key(&mut idx, |&i| pack_key_u128(&data.paths[i as usize]));
+			idx
+		});
+	});
+}
 
-            idx
-        });
-    });
+fn pack_key_u32(path: &TreePath<DEPTH>) -> u32 {
+	let mut key = 0u32;
+	for &b in path.as_bytes() {
+		key = (key << 7) | b as u32;
+	}
+	key
+}
 
-    c.bench_function("radsort_partial", |b| {
-        b.iter(|| {
-            const PACK_DEPTH: usize = 20;
-
-            let mut packed: Vec<([u8; DEPTH], u8, u32)> =
-                Vec::with_capacity(data.paths.len());
-
-            for i in 0..data.paths.len() {
-                packed.push((
-                    data.paths[i],
-                    data.levels[i],
-                    data.values[i],
-                ));
-            }
-
-            sort_by_key(&mut packed, |(path, level, _)| {
-                let mut key: u128 = 0;
-
-                for &b in &path[..PACK_DEPTH] {
-                    key = (key << 6) | b as u128;
-                }
-
-                key = (key << 8) | (255 - *level) as u128;
-
-                key
-            });
-
-            packed
-        });
-    });
+fn pack_key_u128(path: &TreePath<DEPTH>) -> u128 {
+	let mut key = 0u128;
+	for &b in path.as_bytes() {
+		key = (key << 7) | b as u128;
+	}
+	key
 }
 
 criterion_group!(benches, bench_sort);

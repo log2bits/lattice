@@ -1,4 +1,4 @@
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Lut<T> {
 	pub values: Vec<T>,
 }
