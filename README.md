@@ -4,6 +4,19 @@ A voxel renderer with path tracing, built in Rust + WebGPU.
 
 ---
 
+# Data Structure
+Custom **NBEPSVCDAG**
+- N - Nested (chunk trees are nested within one big world tree)
+- B - Bitpacked (values and offsets use only as many bits as required)
+- E - [Efficient](https://research.nvidia.com/sites/default/files/pubs/2010-02_Efficient-Sparse-Voxel/laine2010i3d_paper.pdf) (allows for leaf nodes anywhere in the tree)
+- P - [Pointerless](https://www.cai.sk/ojs/index.php/cai/article/view/2020_3_587) (Implicit offsets are stored instead of explicit pointers)
+- S - Sparse (only occupied nodes are stored, empty space is stored efficiently)
+- V - Voxel (Volumetric Pixel)
+- C - Tetrahexa**contree** (or [64-tree](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/))
+- DAG - Directed Acyclic Graph
+
+---
+
 # Priorities
 
 1. Extremely fast ray traversal
