@@ -2,13 +2,28 @@ use crate::tree::{Level, Tree};
 use super::{Edit, EditPacket, OrderedEdits, DELETE};
 
 impl<const DEPTH: usize> Tree<DEPTH> {
-	pub fn apply_ordered_edits(&mut self, edits: OrderedEdits<DEPTH>) {
+	pub fn queue_edit(&mut self, edit: Edit<DEPTH>) {
+		self.edits.add_edit(edit);
+	}
+
+	pub fn queue_edit_packet(&mut self, packet: EditPacket<DEPTH>) {
+		self.edits.add_edit_packet(packet);
+	}
+
+	pub fn apply_edits(&mut self) {
+		let edits = std::mem::take(&mut self.edits);
 		for packet in edits.packets {
 			self.apply_edit_packet(packet);
 		}
 	}
 
-	pub fn apply_edit_packet(&mut self, mut packet: EditPacket<DEPTH>) {
+	fn apply_ordered_edits(&mut self, edits: OrderedEdits<DEPTH>) {
+		for packet in edits.packets {
+			self.apply_edit_packet(packet);
+		}
+	}
+
+	fn apply_edit_packet(&mut self, mut packet: EditPacket<DEPTH>) {
 		if packet.paths.is_empty() {
 			return;
 		}
@@ -23,10 +38,10 @@ impl<const DEPTH: usize> Tree<DEPTH> {
 			})
 			.collect();
 
-		self.apply_edits(&edits);
+		self.apply_edit_slice(&edits);
 	}
 
-	fn apply_edits(&mut self, edits: &[([u8; DEPTH], usize, u32)]) {
+	fn apply_edit_slice(&mut self, edits: &[([u8; DEPTH], usize, u32)]) {
 		// depth=0 edit covers the whole tree.
 		if let Some(&(_, _, val)) = edits.iter().rfind(|(_, d, _)| *d == 0) {
 			self.occupied = val != DELETE;
@@ -56,9 +71,6 @@ impl<const DEPTH: usize> Tree<DEPTH> {
 		}
 	}
 
-	pub fn add_edit(&mut self, edit: Edit<DEPTH>) {
-		self.edits.add_edit(edit);
-	}
 }
 
 // Allocate an empty node at the given tree depth.
@@ -85,14 +97,27 @@ fn uniform_leaf_value(level: &Level, node: u32) -> Option<u32> {
 	Some(v)
 }
 
-// Representative LOD value for a node: value of its first occupied slot.
+// LOD representative for a node: mode of occupied children's values.
+// Returns DELETE if fewer than half of the 64 slots are occupied.
 fn lod_value(level: &Level, node: u32) -> u32 {
-	let occ = level.occupancy_mask[node as usize];
+	let occ      = level.occupancy_mask[node as usize];
+	let occupied = occ.count_ones() as usize;
+	if occupied < 32 {
+		return DELETE;
+	}
 	let base = level.children_offset[node as usize];
-	let rank = 0; // first occupied slot is rank 0
-	debug_assert!(occ != 0);
-	let _ = occ; // occ guaranteed non-zero by caller
-	level.values.get(base + rank)
+	let mut best_val   = level.values.get(base);
+	let mut best_count = 0usize;
+	for rank in 0..occupied {
+		let val   = level.values.get(base + rank as u32);
+		let count = (0..occupied).filter(|&r| level.values.get(base + r as u32) == val).count();
+		if count > best_count {
+			best_count = count;
+			best_val   = val;
+		}
+		if best_count > occupied / 2 { break; } // majority found, can't be beaten
+	}
+	best_val
 }
 
 // Path-copy edit: reads node at `node_idx`, appends a new modified copy, returns new index.

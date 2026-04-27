@@ -2,7 +2,7 @@ use std::time::Instant;
 use lattice::{
 	chunk,
 	shape::{Sphere, edit_packet_for_shape},
-	tree::{Aabb, Edit, EditPacket, Tree, DELETE},
+	tree::{lod, Aabb, Edit, EditPacket, Tree, DELETE},
 	types::Voxel,
 };
 
@@ -13,8 +13,6 @@ fn root_aabb() -> Aabb {
 	Aabb { min: [0, 0, 0], max: [chunk::SIDE as i64; 3] }
 }
 
-// Center at the middle of the smallest node that fully contains the sphere,
-// so the sphere doesn't straddle node boundaries at any level.
 fn aligned_center(radius: i64) -> [i64; 3] {
 	for &n in &[4i64, 16, 64, 256] {
 		if radius <= n / 2 - 1 {
@@ -42,9 +40,13 @@ fn print_stats(label: &str, tree: &TestTree) {
 	let volume_stored  = t.unique_volume();
 	let leaf_ratio     = leaves_actual as f64 / leaves_stored.max(1) as f64;
 	let volume_ratio   = volume_actual as f64 / volume_stored.max(1) as f64;
+	let svdag_bytes    = t.bytes();
+	let esvo_bytes     = t.esvo_bytes().max(1);
+	let svo_bytes      = t.svo_bytes().max(1);
+	let esvo_ratio     = esvo_bytes as f64 / svdag_bytes.max(1) as f64;
+	let svo_ratio      = svo_bytes as f64 / svdag_bytes.max(1) as f64;
 	println!(
-		"  {label}: {} bytes | leaves {leaves_stored} stored / {leaves_actual} actual ({leaf_ratio:.1}x) | volume {volume_stored} stored / {volume_actual} actual ({volume_ratio:.1}x)",
-		t.bytes(),
+		"  {label}: {svdag_bytes} bytes (ESVO ~{esvo_bytes} {esvo_ratio:.1}x, SVO ~{svo_bytes} {svo_ratio:.1}x) | leaves {leaves_stored}/{leaves_actual} ({leaf_ratio:.1}x) | volume {volume_stored}/{volume_actual} ({volume_ratio:.1}x)",
 	);
 }
 
@@ -61,8 +63,6 @@ fn print_packet_levels(label: &str, packet: &EditPacket<DEPTH>) {
 	}
 	println!();
 }
-
-// ── correctness tests ────────────────────────────────────────────────────────
 
 fn assert_tree_valid(tree: &TestTree) {
 	let mut t = tree.clone();
@@ -97,11 +97,16 @@ fn assert_tree_valid(tree: &TestTree) {
 	}
 }
 
+fn apply(tree: &mut TestTree, packet: EditPacket<DEPTH>) {
+	tree.queue_edit_packet(packet);
+	tree.apply_edits();
+}
+
 fn run_tests() {
 	// 1. Empty tree stays empty.
 	{
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(EditPacket::new(true));
+		apply(&mut tree, EditPacket::new(true));
 		assert!(!tree.occupied);
 	}
 
@@ -110,7 +115,7 @@ fn run_tests() {
 		let mut tree = TestTree::new(1);
 		let mut p = EditPacket::new(false);
 		p.add_edit(Edit::new(42, [0, 0, 0], DEPTH as u8, 1));
-		tree.apply_edit_packet(p);
+		apply(&mut tree, p);
 		assert!(tree.occupied);
 		assert_tree_valid(&tree);
 	}
@@ -118,27 +123,27 @@ fn run_tests() {
 	// 3. Root-level edit (depth=0) collapses tree.
 	{
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(make_sphere(100));
+		apply(&mut tree, make_sphere(100));
 		let mut p = EditPacket::new(false);
 		p.add_edit(Edit::new(99, [0, 0, 0], 0, 1));
-		tree.apply_edit_packet(p);
+		apply(&mut tree, p);
 		assert!(tree.is_leaf && tree.value == 99);
 	}
 
 	// 4. Root DELETE clears tree.
 	{
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(make_sphere(100));
+		apply(&mut tree, make_sphere(100));
 		let mut p = EditPacket::new(false);
 		p.add_edit(Edit::new(DELETE, [0, 0, 0], 0, 1));
-		tree.apply_edit_packet(p);
+		apply(&mut tree, p);
 		assert!(!tree.occupied);
 	}
 
 	// 5. Sphere produces valid tree.
 	{
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(make_sphere(100));
+		apply(&mut tree, make_sphere(100));
 		assert!(tree.occupied);
 		assert_tree_valid(&tree);
 	}
@@ -146,22 +151,22 @@ fn run_tests() {
 	// 6. Two overlapping spheres.
 	{
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(make_sphere(80));
+		apply(&mut tree, make_sphere(80));
 		assert_tree_valid(&tree);
-		tree.apply_edit_packet(make_sphere(40));
+		apply(&mut tree, make_sphere(40));
 		assert_tree_valid(&tree);
 	}
 
 	// 7. Sphere then delete sphere.
 	{
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(make_sphere(100));
+		apply(&mut tree, make_sphere(100));
 		let del = {
 			let center = [chunk::SIDE as i64 / 2; 3];
 			let sphere = Sphere { center, radius: 100, material: Voxel::delete() };
 			edit_packet_for_shape::<DEPTH>(&sphere, root_aabb())
 		};
-		tree.apply_edit_packet(del);
+		apply(&mut tree, del);
 		assert_tree_valid(&tree);
 	}
 
@@ -170,10 +175,10 @@ fn run_tests() {
 		let mut tree = TestTree::new(1);
 		let mut p = EditPacket::new(false);
 		p.add_edit(Edit::new(1, [0, 0, 0], 0, 1));
-		tree.apply_edit_packet(p);
+		apply(&mut tree, p);
 		let mut p2 = EditPacket::new(false);
 		p2.add_edit(Edit::new(2, [0, 0, 0], DEPTH as u8, 1));
-		tree.apply_edit_packet(p2);
+		apply(&mut tree, p2);
 		assert!(tree.occupied && !tree.is_leaf);
 		assert_tree_valid(&tree);
 	}
@@ -183,10 +188,10 @@ fn run_tests() {
 		let mut tree = TestTree::new(1);
 		let mut p = EditPacket::new(false);
 		p.add_edit(Edit::new(7, [0, 0, 0], 0, 1));
-		tree.apply_edit_packet(p);
+		apply(&mut tree, p);
 		let mut p2 = EditPacket::new(false);
 		p2.add_edit(Edit::new(DELETE, [0, 0, 0], DEPTH as u8, 1));
-		tree.apply_edit_packet(p2);
+		apply(&mut tree, p2);
 		assert!(tree.occupied);
 		assert_tree_valid(&tree);
 	}
@@ -196,11 +201,59 @@ fn run_tests() {
 		let mut t1 = TestTree::new(1);
 		let mut t2 = TestTree::new(1);
 		let p = make_sphere(60);
-		t1.apply_edit_packet(p.clone());
-		t2.apply_edit_packet(p.clone());
-		t2.apply_edit_packet(p);
+		apply(&mut t1, p.clone());
+		apply(&mut t2, p.clone());
+		apply(&mut t2, p);
 		assert_tree_valid(&t1);
 		assert_tree_valid(&t2);
+	}
+
+	// 11. Merge 64 empty children → empty tree.
+	{
+		let children: [TestTree; 64] = std::array::from_fn(|_| TestTree::new(1));
+		let merged = lod::merge(&children);
+		assert!(!merged.occupied);
+	}
+
+	// 12. Merge 64 uniform leaf children → occupied tree.
+	{
+		let children: [TestTree; 64] = std::array::from_fn(|_| {
+			let mut t = TestTree::new(1);
+			t.occupied = true;
+			t.is_leaf = true;
+			t.value = 42;
+			t
+		});
+		let merged = lod::merge(&children);
+		assert!(merged.occupied);
+		assert_tree_valid(&merged);
+	}
+
+	// 13. Merge sphere children, split back, check each is occupied.
+	{
+		let mut children: [TestTree; 64] = std::array::from_fn(|_| TestTree::new(1));
+		for child in children.iter_mut() {
+			apply(child, make_sphere(2));
+		}
+		let merged = lod::merge(&children);
+		assert!(merged.occupied);
+		assert_tree_valid(&merged);
+		let split = lod::split(&merged);
+		for t in &split {
+			assert!(t.occupied, "expected occupied after split");
+		}
+	}
+
+	// 14. Split a full leaf tree → 64 leaf children.
+	{
+		let mut tree = TestTree::new(4);
+		tree.occupied = true;
+		tree.is_leaf = true;
+		tree.value = 7;
+		let split = lod::split(&tree);
+		for t in &split {
+			assert!(t.occupied && t.is_leaf && t.value == 7);
+		}
 	}
 
 	println!("all apply tests passed");
@@ -232,7 +285,7 @@ fn make_grid_spheres() -> TestTree {
 			for z in 0..16i64 {
 				let center = [x * 16 + 8, y * 16 + 8, z * 16 + 8];
 				let sphere = Sphere { center, radius: 7, material };
-				tree.apply_edit_packet(edit_packet_for_shape::<DEPTH>(&sphere, aabb));
+				apply(&mut tree, edit_packet_for_shape::<DEPTH>(&sphere, aabb));
 			}
 		}
 	}
@@ -259,9 +312,8 @@ fn main() {
 
 	println!("\nsphere stats (fresh tree, leaf_size=1):");
 	for &r in &radii {
-		let packet = make_sphere(r);
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(packet);
+		apply(&mut tree, make_sphere(r));
 		print_stats(&format!("r={r:3}"), &tree);
 	}
 
@@ -270,7 +322,7 @@ fn main() {
 		let packet = make_sphere(r);
 		let d = time_one(|| {
 			let mut tree = TestTree::new(1);
-			tree.apply_edit_packet(packet.clone());
+			apply(&mut tree, packet.clone());
 			std::hint::black_box(tree);
 		});
 		println!("  r={r:3}: {}", fmt_duration(d));
@@ -280,7 +332,7 @@ fn main() {
 	{
 		let mut p = EditPacket::new(false);
 		p.add_edit(Edit::new(1, [0, 0, 0], 0, 1));
-		full_tree.apply_edit_packet(p);
+		apply(&mut full_tree, p);
 	}
 
 	println!("\napply_sphere_onto_full:");
@@ -288,10 +340,20 @@ fn main() {
 		let packet = make_sphere(r);
 		let d = time_one(|| {
 			let mut tree = full_tree.clone();
-			tree.apply_edit_packet(packet.clone());
+			apply(&mut tree, packet.clone());
 			std::hint::black_box(tree);
 		});
 		println!("  r={r:3}: {}", fmt_duration(d));
+	}
+
+	println!("\nr=512 sphere (entire chunk should collapse to single root leaf):");
+	{
+		let material = Voxel::from_rgb_flags([100, 150, 200], 0, false, false, false, false);
+		let sphere = Sphere { center: [128, 128, 128], radius: 512, material };
+		let mut tree = TestTree::new(1);
+		apply(&mut tree, edit_packet_for_shape::<DEPTH>(&sphere, root_aabb()));
+		print_stats("stats", &tree);
+		print_node_counts("node counts per level", &tree);
 	}
 
 	println!("\nsingle r=7 sphere (same alignment as grid):");
@@ -299,7 +361,7 @@ fn main() {
 		let material = Voxel::from_rgb_flags([100, 150, 200], 0, false, false, false, false);
 		let sphere = Sphere { center: [8, 8, 8], radius: 7, material };
 		let mut tree = TestTree::new(1);
-		tree.apply_edit_packet(edit_packet_for_shape::<DEPTH>(&sphere, root_aabb()));
+		apply(&mut tree, edit_packet_for_shape::<DEPTH>(&sphere, root_aabb()));
 		print_stats("stats", &tree);
 		print_node_counts("node counts per level", &tree);
 	}
